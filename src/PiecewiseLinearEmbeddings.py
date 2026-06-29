@@ -504,52 +504,88 @@ class OptimizedPiecewiseLinearEmbeddings(nn.Module):
             .to(dtype=self.anchors.dtype)
         )
 
-        # [batch_size, n_features]
-        global_right_indices = (
-            local_bin
-            + self.anchor_offsets
-        )
+        # -----------------------------------------------------
+        # Construct anchor indices directly inside the final
+        # [batch_size, n_features, 2] tensor.
+        #
+        # Column 0: left anchor index.
+        # Column 1: right anchor index.
+        # -----------------------------------------------------
 
-        has_left_anchor = local_bin.ne(0)
-
-        global_left_indices = (
-            global_right_indices
-            - has_left_anchor.to(
-                global_right_indices.dtype
-            )
-        )
-
-        anchor_indices = torch.stack(
+        anchor_indices = torch.empty(
             (
-                global_left_indices,
-                global_right_indices,
+                batch_size,
+                self.n_features,
+                2,
             ),
-            dim=-1,
-        ).reshape(
+            dtype=local_bin.dtype,
+            device=local_bin.device,
+        )
+
+        left_indices = anchor_indices[..., 0]
+        right_indices = anchor_indices[..., 1]
+
+        # Right anchor:
+        #
+        #     anchor_offsets + local_bin
+        right_indices.copy_(local_bin)
+        right_indices.add_(self.anchor_offsets)
+
+        # Left anchor:
+        #
+        #     anchor_offsets + max(local_bin - 1, 0)
+        left_indices.copy_(local_bin)
+        left_indices.sub_(1)
+        left_indices.clamp_min_(0)
+        left_indices.add_(self.anchor_offsets)
+
+        anchor_indices = anchor_indices.view(
             -1,
             2,
         )
 
-        left_weight = (
-            (1.0 - position)
-            * has_left_anchor.to(
-                position.dtype
+        # -----------------------------------------------------
+        # Construct anchor weights directly in the final
+        # [batch_size, n_features, 2] tensor.
+        #
+        # Initially:
+        #
+        #     column 0 = position
+        #     column 1 = position
+        #
+        # Then column 0 is converted to:
+        #
+        #     1 - position, if a left anchor exists;
+        #     0,            for the first bin.
+        #
+        # expand() itself does not allocate memory.
+        # clone() allocates exactly the final output tensor.
+        # -----------------------------------------------------
+
+        anchor_weights = (
+            position
+            .unsqueeze(-1)
+            .expand(
+                -1,
+                -1,
+                2,
             )
+            .clone()
         )
 
-        anchor_weights = torch.stack(
-            (
-                left_weight,
-                position,
-            ),
-            dim=-1,
-        ).reshape(
+        left_weight = anchor_weights[..., 0]
+
+        left_weight.neg_()
+        left_weight.add_(1.0)
+
+        left_weight.masked_fill_(
+            local_bin.eq(0),
+            0.0,
+        )
+
+        anchor_weights = anchor_weights.view(
             -1,
             2,
-        )
-
-        anchor_weights = anchor_weights.to(
-            self.anchors.dtype
         )
 
         x_ple = F.embedding_bag(
