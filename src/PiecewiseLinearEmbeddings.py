@@ -2,10 +2,10 @@ import warnings
 from typing import Literal, Optional
 
 import torch
+import torch.nn.functional as F
+from rtdl_num_embeddings import _check_bins
 from torch import Tensor, nn
 from torch.nn.parameter import Parameter
-from rtdl_num_embeddings import _check_bins
-import torch.nn.functional as F
 
 
 class _FeatureLinearEmbedding(nn.Module):
@@ -141,7 +141,7 @@ class OptimizedPiecewiseLinearEmbeddings(nn.Module):
         base_device = bins[0].device
 
         # -----------------------------------------------------
-        # Padded edges are required only by torch.searchsorted.
+        # Padded edges are required by torch.searchsorted.
         #
         # All edges are intentionally stored in float32.
         # -----------------------------------------------------
@@ -152,6 +152,22 @@ class OptimizedPiecewiseLinearEmbeddings(nn.Module):
                 self.max_n_bins + 1,
             ),
             torch.inf,
+            dtype=torch.float32,
+            device=base_device,
+        )
+
+        # -----------------------------------------------------
+        # Cache right_edge - left_edge for every real bin.
+        #
+        # The layout matches padded_edges, so the same flattened
+        # indices can be reused in forward.
+        # -----------------------------------------------------
+
+        padded_bin_widths = torch.ones(
+            (
+                self.n_features,
+                self.max_n_bins + 1,
+            ),
             dtype=torch.float32,
             device=base_device,
         )
@@ -167,9 +183,22 @@ class OptimizedPiecewiseLinearEmbeddings(nn.Module):
                 :edges_float32.numel(),
             ] = edges_float32
 
+            padded_bin_widths[
+                feature_idx,
+                :edges_float32.numel() - 1,
+            ] = (
+                edges_float32[1:]
+                - edges_float32[:-1]
+            )
+
         self.register_buffer(
             "bin_edges",
             padded_edges,
+        )
+
+        self.register_buffer(
+            "bin_widths",
+            padded_bin_widths,
         )
 
         # -----------------------------------------------------
@@ -289,14 +318,15 @@ class OptimizedPiecewiseLinearEmbeddings(nn.Module):
 
     def _apply(self, fn):
         """
-        Apply device/dtype transformations while keeping bin edges in float32.
+        Apply device/dtype transformations while keeping bin data in float32.
 
         Calling module.half() or module.bfloat16() changes trainable parameters,
-        but the bin search remains in float32.
+        but the bin search and position computation remain in float32.
         """
         super()._apply(fn)
 
         self.bin_edges = self.bin_edges.float()
+        self.bin_widths = self.bin_widths.float()
 
         return self
 
@@ -418,7 +448,8 @@ class OptimizedPiecewiseLinearEmbeddings(nn.Module):
         )
 
         # -----------------------------------------------------
-        # Select the left and right numerical bin edges.
+        # Select the left numerical bin edge and the cached
+        # bin width.
         #
         # Flattened indexing allows keeping int32 indices.
         # -----------------------------------------------------
@@ -428,23 +459,23 @@ class OptimizedPiecewiseLinearEmbeddings(nn.Module):
             + self.edge_offsets.unsqueeze(1)
         )
 
-        flat_edges = self.bin_edges.reshape(-1)
+        flat_edge_indices = (
+            left_edge_indices.reshape(-1)
+        )
 
         left_edges = torch.index_select(
-            flat_edges,
+            self.bin_edges.reshape(-1),
             dim=0,
-            index=left_edge_indices.reshape(-1),
+            index=flat_edge_indices,
         ).view(
             self.n_features,
             batch_size,
         )
 
-        right_edges = torch.index_select(
-            flat_edges,
+        bin_widths = torch.index_select(
+            self.bin_widths.reshape(-1),
             dim=0,
-            index=(
-                left_edge_indices.reshape(-1) + 1
-            ),
+            index=flat_edge_indices,
         ).view(
             self.n_features,
             batch_size,
@@ -453,8 +484,10 @@ class OptimizedPiecewiseLinearEmbeddings(nn.Module):
         # t may be below zero or above one for extrapolation.
         position_by_feature = (
             values_by_feature - left_edges
-        ) / (
-            right_edges - left_edges
+        )
+
+        position_by_feature.div_(
+            bin_widths
         )
 
         # Convert to the batch-major layout used by the output.
@@ -472,31 +505,36 @@ class OptimizedPiecewiseLinearEmbeddings(nn.Module):
         )
 
         # [batch_size, n_features]
-        global_right_indices = local_bin + self.anchor_offsets
+        global_right_indices = (
+            local_bin
+            + self.anchor_offsets
+        )
 
         has_left_anchor = local_bin.ne(0)
 
         global_left_indices = (
             global_right_indices
-            - has_left_anchor.to(global_right_indices.dtype)
+            - has_left_anchor.to(
+                global_right_indices.dtype
+            )
         )
+
         anchor_indices = torch.stack(
             (
                 global_left_indices,
                 global_right_indices,
             ),
             dim=-1,
-        ).reshape(-1, 2)
+        ).reshape(
+            -1,
+            2,
+        )
 
-        # Вес левого anchor:
-        #   (1 - position), если bin > 0
-        #   0,              если bin == 0
-        #
-        # Вес правого anchor:
-        #   position
         left_weight = (
             (1.0 - position)
-            * has_left_anchor.to(position.dtype)
+            * has_left_anchor.to(
+                position.dtype
+            )
         )
 
         anchor_weights = torch.stack(
@@ -505,9 +543,14 @@ class OptimizedPiecewiseLinearEmbeddings(nn.Module):
                 position,
             ),
             dim=-1,
-        ).reshape(-1, 2)
+        ).reshape(
+            -1,
+            2,
+        )
 
-        anchor_weights = anchor_weights.to(self.anchors.dtype)
+        anchor_weights = anchor_weights.to(
+            self.anchors.dtype
+        )
 
         x_ple = F.embedding_bag(
             input=anchor_indices,
