@@ -5,7 +5,7 @@ import torch
 from torch import Tensor, nn
 from torch.nn.parameter import Parameter
 from rtdl_num_embeddings import _check_bins
-
+import torch.nn.functional as F
 
 
 class _FeatureLinearEmbedding(nn.Module):
@@ -471,69 +471,55 @@ class OptimizedPiecewiseLinearEmbeddings(nn.Module):
             .to(dtype=self.anchors.dtype)
         )
 
-        # -----------------------------------------------------
-        # Select the right anchor of each active bin.
-        #
-        # global_right_index[n, f] =
-        #     anchor_offsets[f] + local_bin[n, f]
-        # -----------------------------------------------------
+        # [batch_size, n_features]
+        global_right_indices = local_bin + self.anchor_offsets
 
-        global_right_indices = (
-            local_bin
-            + self.anchor_offsets.unsqueeze(0)
+        has_left_anchor = local_bin.ne(0)
+
+        global_left_indices = (
+            global_right_indices
+            - has_left_anchor.to(global_right_indices.dtype)
+        )
+        anchor_indices = torch.stack(
+            (
+                global_left_indices,
+                global_right_indices,
+            ),
+            dim=-1,
+        ).reshape(-1, 2)
+
+        # Вес левого anchor:
+        #   (1 - position), если bin > 0
+        #   0,              если bin == 0
+        #
+        # Вес правого anchor:
+        #   position
+        left_weight = (
+            (1.0 - position)
+            * has_left_anchor.to(position.dtype)
         )
 
-        right_anchors = torch.index_select(
-            self.anchors,
-            dim=0,
-            index=global_right_indices.reshape(-1),
+        anchor_weights = torch.stack(
+            (
+                left_weight,
+                position,
+            ),
+            dim=-1,
+        ).reshape(-1, 2)
+
+        anchor_weights = anchor_weights.to(self.anchors.dtype)
+
+        x_ple = F.embedding_bag(
+            input=anchor_indices,
+            weight=self.anchors,
+            offsets=None,
+            mode="sum",
+            per_sample_weights=anchor_weights,
+            sparse=False,
         ).view(
             batch_size,
             self.n_features,
             self.d_embedding,
-        )
-
-        # -----------------------------------------------------
-        # Select the left anchor.
-        #
-        # For bin zero, the left anchor is fixed at zero.
-        # For all other bins, it is the previous right anchor.
-        # -----------------------------------------------------
-
-        global_left_indices = torch.maximum(
-            global_right_indices - 1,
-            self.anchor_offsets.unsqueeze(0),
-        )
-
-        left_anchors = torch.index_select(
-            self.anchors,
-            dim=0,
-            index=global_left_indices.reshape(-1),
-        ).view(
-            batch_size,
-            self.n_features,
-            self.d_embedding,
-        )
-
-        has_trainable_left_anchor = (
-            local_bin != 0
-        ).unsqueeze(-1)
-
-        left_anchors = (
-            left_anchors
-            * has_trainable_left_anchor
-        )
-
-        # -----------------------------------------------------
-        # Linear interpolation or extrapolation:
-        #
-        # y = left + t * (right - left)
-        # -----------------------------------------------------
-
-        x_ple = torch.lerp(
-            left_anchors,
-            right_anchors,
-            position.unsqueeze(-1),
         )
 
         if self.bias is not None:
