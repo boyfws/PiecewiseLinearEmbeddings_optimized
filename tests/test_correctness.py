@@ -11,7 +11,8 @@ from torch import Tensor, nn
 
 from rtdl_num_embeddings import PiecewiseLinearEmbeddings
 from src.PiecewiseLinearEmbeddings import OptimizedPiecewiseLinearEmbeddings
-from tests.utils.map_state_dict import convert_old_ple_state_dict
+from tests.utils import convert_old_ple_state_dict, sample_features, make_bins, BIN_CASE_NAMES
+
 from typing import Literal
 
 FORWARD_RTOL = 2e-5
@@ -25,127 +26,8 @@ GRAD_ATOL = 5e-6
 TEST_DEVICES = ["cpu", "cuda"] if torch.cuda.is_available() else ["cpu"]
 
 
-BIN_CASE_NAMES = (
-    "equal",
-    "ragged",
-    "single_bin",
-    "all_single_bin",
-)
-
-
 D_EMBEDDING_VALUES = (10, 15, 20)
 SEED_VALUES = (42, 0, 1)
-
-def make_bins(
-    case_name: str,
-    *,
-    dtype: torch.dtype = torch.float32,
-) -> list[Tensor]:
-    if case_name == "equal":
-        return [
-            torch.tensor(
-                [-4.0, -2.0, 0.0, 1.5, 5.0],
-                dtype=dtype,
-            ),
-            torch.tensor(
-                [-3.0, -1.0, 0.5, 2.0, 6.0],
-                dtype=dtype,
-            ),
-            torch.tensor(
-                [-5.0, -2.5, -0.5, 3.0, 8.0],
-                dtype=dtype,
-            ),
-        ]
-
-    if case_name == "ragged":
-        return [
-            torch.tensor(
-                [-4.0, -2.0, 0.0, 1.5, 5.0],
-                dtype=dtype,
-            ),
-            torch.tensor(
-                [-3.0, 0.0, 4.0],
-                dtype=dtype,
-            ),
-            torch.tensor(
-                [-6.0, -3.0, -1.0, 0.5, 2.5, 7.0],
-                dtype=dtype,
-            ),
-            torch.tensor(
-                [-2.0, 1.0, 5.0, 9.0],
-                dtype=dtype,
-            ),
-        ]
-
-    if case_name == "single_bin":
-        return [
-            torch.tensor(
-                [-4.0, -2.0, 0.0, 1.5, 5.0],
-                dtype=dtype,
-            ),
-            torch.tensor(
-                [-1.0, 3.0],
-                dtype=dtype,
-            ),
-            torch.tensor(
-                [-5.0, -1.0, 2.0, 6.0],
-                dtype=dtype,
-            ),
-        ]
-
-    if case_name == "all_single_bin":
-        return [
-            torch.tensor(
-                [-3.0, 2.0],
-                dtype=dtype,
-            ),
-            torch.tensor(
-                [-1.0, 4.0],
-                dtype=dtype,
-            ),
-            torch.tensor(
-                [-5.0, 5.0],
-                dtype=dtype,
-            ),
-        ]
-
-    raise ValueError(
-        f"Unknown bin case: {case_name!r}. "
-        f"Expected one of {BIN_CASE_NAMES}"
-    )
-
-
-
-
-def sample_features(
-    bins: Sequence[Tensor],
-    *,
-    batch_size: int,
-    seed: int,
-) -> Tensor:
-    # 50 % inside bins 25% below first edge 25 % above last edge
-    torch.manual_seed(seed)
-
-    assert batch_size % 4 == 0 
-
-    half_size = batch_size // 2
-    quarter_size =  batch_size // 4
-
-    inputs = []
-
-    for edges in bins:
-        min_val = edges[0].item()
-        max_val = edges[-1].item()
-
-        inside = torch.randn(half_size) * (max_val - min_val) + min_val
-        below = min_val - torch.rand(quarter_size).abs() * (max_val - min_val)
-        above = max_val + torch.rand(quarter_size).abs() * (max_val - min_val)
-
-        input_tensor = torch.cat([inside, below, above])
-        inputs.append(input_tensor)
-
-    return torch.stack(inputs, dim=1)
-
 
 
 @torch.no_grad()
