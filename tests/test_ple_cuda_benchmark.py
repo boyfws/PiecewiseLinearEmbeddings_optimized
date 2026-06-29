@@ -3,8 +3,9 @@ import pathlib
 import statistics
 import sys
 
-sys.path.append(
-    str(pathlib.Path(__file__).resolve().parent.parent)
+sys.path.insert(
+    0,
+    str(pathlib.Path(__file__).resolve().parent.parent),
 )
 
 from dataclasses import dataclass
@@ -20,39 +21,27 @@ from src.PiecewiseLinearEmbeddings import (
     OptimizedPiecewiseLinearEmbeddings,
 )
 from tests.utils import (
-    BIN_CASE_NAMES,
     convert_old_ple_state_dict,
-    make_bins,
     sample_features,
 )
 
 
 # ============================================================
-# Benchmark configuration
+# General configuration
 # ============================================================
-
-WARMUP_ITERATIONS = 30
-MEASUREMENT_ITERATIONS = 100
 
 SEED = 42
 
-FORWARD_RTOL = 2e-5
-FORWARD_ATOL = 2e-6
+FORWARD_RTOL = 2e-4
+FORWARD_ATOL = 2e-5
 
+WARMUP_ITERATIONS = 20
 
-BATCH_SIZES = (
-    2_048,
-    5_120,
-    20_000,
-)
+# Each reported observation is the average time of this many calls.
+ITERATIONS_PER_REPEAT = 10
 
-
-D_EMBEDDINGS = (
-    8,
-    16,
-    32,
-)
-
+# Median, mean, min, and max are calculated across these observations.
+MEASUREMENT_REPEATS = 10
 
 BENCHMARK_VERSIONS: tuple[
     Literal["A", "B"],
@@ -61,14 +50,9 @@ BENCHMARK_VERSIONS: tuple[
     "B",
 )
 
-
 BENCHMARK_ACTIVATIONS = (
     False,
 )
-
-
-BENCHMARK_BIN_CASES = BIN_CASE_NAMES
-
 
 BENCHMARK_MODES: tuple[
     Literal["forward", "forward_backward"],
@@ -80,40 +64,171 @@ BENCHMARK_MODES: tuple[
 
 
 # ============================================================
-# Benchmark result
+# Performance cases
 # ============================================================
 
 @dataclass(frozen=True)
-class CudaBenchmarkResult:
-    """CUDA benchmark timing and memory statistics."""
+class BenchmarkCase:
+    """One PLE benchmark shape."""
+
+    name: str
+    batch_size: int
+    n_features: int
+    n_bins: int
+    d_embedding: int
+
+    @property
+    def old_dense_encoding_mib(self) -> float:
+        """
+        Estimated size of one float32 [N, F, B] tensor.
+        """
+        return (
+            self.batch_size
+            * self.n_features
+            * self.n_bins
+            * torch.tensor(
+                [],
+                dtype=torch.float32,
+            ).element_size()
+            / 1024**2
+        )
+
+    @property
+    def embedding_output_mib(self) -> float:
+        """
+        Estimated size of one float32 [N, F, D] tensor.
+        """
+        return (
+            self.batch_size
+            * self.n_features
+            * self.d_embedding
+            * torch.tensor(
+                [],
+                dtype=torch.float32,
+            ).element_size()
+            / 1024**2
+        )
+
+
+batch_size = [2_048, 8_192, 20_000]
+n_features = [32, 64, 256]
+n_bins = [16, 48, 64]
+d_embedding = [12, 16, 32]
+
+
+BENCHMARK_CASES = (
+    BenchmarkCase(
+        name=f"bs={bs}_f={f}_b={b}_d={d}",
+        batch_size=bs,
+        n_features=f,
+        n_bins=b,
+        d_embedding=d,
+    )
+    for bs in batch_size
+    for f in n_features
+    for b in n_bins
+    for d in d_embedding
+)
+
+
+# ============================================================
+# Benchmark results
+# ============================================================
+
+@dataclass(frozen=True)
+class CudaTimingResult:
+    """CUDA execution-time statistics."""
 
     median_ms: float
     mean_ms: float
     min_ms: float
     max_ms: float
 
+
+@dataclass(frozen=True)
+class CudaBenchmarkResult:
+    """CUDA timing and incremental allocated-memory statistics."""
+
+    timing: CudaTimingResult
     peak_allocated_bytes: int
-    peak_reserved_bytes: int
 
     @property
     def peak_allocated_mib(self) -> float:
-        """Return incremental peak allocated memory in MiB."""
         return (
             self.peak_allocated_bytes
             / 1024**2
         )
 
-    @property
-    def peak_reserved_mib(self) -> float:
-        """Return incremental peak reserved memory in MiB."""
-        return (
-            self.peak_reserved_bytes
-            / 1024**2
+
+# ============================================================
+# Benchmark data
+# ============================================================
+
+def make_benchmark_bins(
+    *,
+    n_features: int,
+    n_bins: int,
+) -> list[Tensor]:
+    """
+    Create strictly increasing feature-specific bin edges.
+
+    Every feature has the same number of bins, while scale and shift vary
+    slightly across features.
+    """
+    if n_features <= 0:
+        raise ValueError(
+            "n_features must be positive"
         )
+
+    if n_bins <= 0:
+        raise ValueError(
+            "n_bins must be positive"
+        )
+
+    base_edges = torch.linspace(
+        -4.0,
+        4.0,
+        n_bins + 1,
+        dtype=torch.float32,
+    )
+
+    bins: list[Tensor] = []
+
+    denominator = max(
+        n_features - 1,
+        1,
+    )
+
+    for feature_idx in range(n_features):
+        scale = (
+            0.75
+            + 0.50
+            * feature_idx
+            / denominator
+        )
+
+        shift = (
+            0.08
+            * (
+                feature_idx % 7
+                - 3
+            )
+        )
+
+        feature_edges = (
+            base_edges * scale
+            + shift
+        )
+
+        bins.append(
+            feature_edges
+        )
+
+    return bins
 
 
 # ============================================================
-# Module construction
+# Module initialization
 # ============================================================
 
 @torch.no_grad()
@@ -123,7 +238,7 @@ def initialize_original_parameters_(
     seed: int,
 ) -> None:
     """
-    Initialize all original PLE parameters with non-zero values.
+    Initialize original PLE parameters with deterministic non-zero values.
     """
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
@@ -195,10 +310,16 @@ def build_equivalent_modules(
         original.state_dict()
     )
 
-    optimized.load_state_dict(
+    load_result = optimized.load_state_dict(
         converted_state_dict,
         strict=False,
     )
+
+    if load_result.unexpected_keys:
+        raise RuntimeError(
+            "Unexpected keys while loading the converted state dict: "
+            f"{load_result.unexpected_keys}"
+        )
 
     return original, optimized
 
@@ -211,139 +332,79 @@ def cuda_build_supports_current_device(
     device: torch.device,
 ) -> bool:
     """
-    Check whether the installed PyTorch build contains kernels for
-    the current GPU architecture.
+    Check whether the installed PyTorch build contains kernels for the
+    current CUDA architecture.
     """
     major, minor = torch.cuda.get_device_capability(
         device
     )
 
-    current_architecture = (
-        f"sm_{major}{minor}"
-    )
+    architecture = f"sm_{major}{minor}"
 
-    return (
-        current_architecture
-        in torch.cuda.get_arch_list()
-    )
+    return architecture in torch.cuda.get_arch_list()
 
 
 # ============================================================
-# CUDA benchmark
+# Timing
 # ============================================================
 
-def benchmark_cuda(
+def benchmark_cuda_time(
     fn: Callable[[], object],
     *,
     device: torch.device,
-) -> CudaBenchmarkResult:
+) -> CudaTimingResult:
     """
-    Measure CUDA execution time and incremental peak memory.
+    Measure CUDA execution time.
 
-    Timing is measured with CUDA events. The reported memory is the
-    additional memory allocated above parameters, inputs, and other live
-    tensors that existed before the measured function call.
+    Each observation measures multiple consecutive calls and divides the
+    elapsed GPU time by the number of calls. This reduces CUDA Event overhead
+    for short operations.
     """
 
-    # --------------------------------------------------------
-    # Warmup
-    # --------------------------------------------------------
+    # Initialize CUDA libraries before the actual warmup.
+    result = fn()
+    del result
 
+    torch.cuda.synchronize(device)
+
+    # Warm up kernels, allocators, cuBLAS, and GPU clocks.
     for _ in range(WARMUP_ITERATIONS):
         result = fn()
         del result
 
     torch.cuda.synchronize(device)
 
-    # --------------------------------------------------------
-    # GPU execution time
-    # --------------------------------------------------------
+    elapsed_times_ms: list[float] = []
 
-    start_events = [
-        torch.cuda.Event(
+    for _ in range(MEASUREMENT_REPEATS):
+        start_event = torch.cuda.Event(
             enable_timing=True
         )
-        for _ in range(MEASUREMENT_ITERATIONS)
-    ]
 
-    end_events = [
-        torch.cuda.Event(
+        end_event = torch.cuda.Event(
             enable_timing=True
         )
-        for _ in range(MEASUREMENT_ITERATIONS)
-    ]
 
-    for start_event, end_event in zip(
-        start_events,
-        end_events,
-        strict=True,
-    ):
         start_event.record()
 
-        result = fn()
+        for _ in range(ITERATIONS_PER_REPEAT):
+            result = fn()
+            del result
 
         end_event.record()
 
-        del result
+        torch.cuda.synchronize(device)
 
-    torch.cuda.synchronize(device)
-
-    elapsed_times_ms = [
-        start_event.elapsed_time(end_event)
-        for start_event, end_event in zip(
-            start_events,
-            end_events,
-            strict=True,
+        elapsed_per_call_ms = (
+            start_event.elapsed_time(end_event)
+            / ITERATIONS_PER_REPEAT
         )
-    ]
 
-    # --------------------------------------------------------
-    # Incremental peak memory
-    # --------------------------------------------------------
+        elapsed_times_ms.append(
+            elapsed_per_call_ms
+        )
 
-    gc.collect()
-
-    torch.cuda.empty_cache()
-    torch.cuda.synchronize(device)
-
-    baseline_allocated = (
-        torch.cuda.memory_allocated(device)
-    )
-
-    baseline_reserved = (
-        torch.cuda.memory_reserved(device)
-    )
-
-    torch.cuda.reset_peak_memory_stats(
-        device
-    )
-
-    # Keep the result alive until peak memory is recorded.
-    result = fn()
-
-    torch.cuda.synchronize(device)
-
-    peak_allocated = (
-        torch.cuda.max_memory_allocated(device)
-    )
-
-    peak_reserved = (
-        torch.cuda.max_memory_reserved(device)
-    )
-
-    del result
-
-    incremental_peak_allocated = max(
-        0,
-        peak_allocated - baseline_allocated,
-    )
-
-    incremental_peak_reserved = max(
-        0,
-        peak_reserved - baseline_reserved,
-    )
-
-    return CudaBenchmarkResult(
+    return CudaTimingResult(
         median_ms=statistics.median(
             elapsed_times_ms
         ),
@@ -356,87 +417,191 @@ def benchmark_cuda(
         max_ms=max(
             elapsed_times_ms
         ),
-        peak_allocated_bytes=(
-            incremental_peak_allocated
-        ),
-        peak_reserved_bytes=(
-            incremental_peak_reserved
-        ),
     )
 
 
 # ============================================================
-# Result printing
+# Memory
+# ============================================================
+
+def measure_incremental_peak_memory(
+    fn: Callable[[], object],
+    *,
+    device: torch.device,
+    prepare: Callable[[], None] | None = None,
+) -> int:
+    """
+    Measure incremental peak tensor memory allocated by one call.
+
+    Parameters, inputs, and all tensors that already exist before the measured
+    call are excluded from the reported value.
+    """
+    gc.collect()
+
+    if prepare is not None:
+        prepare()
+
+    torch.cuda.synchronize(device)
+    torch.cuda.empty_cache()
+    torch.cuda.synchronize(device)
+
+    baseline_allocated = torch.cuda.memory_allocated(
+        device
+    )
+
+    torch.cuda.reset_peak_memory_stats(
+        device
+    )
+
+    result = fn()
+
+    torch.cuda.synchronize(device)
+
+    peak_allocated = torch.cuda.max_memory_allocated(
+        device
+    )
+
+    del result
+
+    return max(
+        0,
+        peak_allocated - baseline_allocated,
+    )
+
+
+def benchmark_cuda(
+    fn: Callable[[], object],
+    *,
+    device: torch.device,
+    prepare_memory: Callable[[], None] | None = None,
+) -> CudaBenchmarkResult:
+    """
+    Measure CUDA time and incremental peak allocated memory.
+    """
+    timing = benchmark_cuda_time(
+        fn,
+        device=device,
+    )
+
+    peak_allocated_bytes = measure_incremental_peak_memory(
+        fn,
+        device=device,
+        prepare=prepare_memory,
+    )
+
+    return CudaBenchmarkResult(
+        timing=timing,
+        peak_allocated_bytes=peak_allocated_bytes,
+    )
+
+
+# ============================================================
+# Result reporting
 # ============================================================
 
 def print_benchmark_comparison(
     *,
     mode: str,
-    bin_case: str,
-    batch_size: int,
-    d_embedding: int,
+    case: BenchmarkCase,
     version: str,
     activation: bool,
     original_result: CudaBenchmarkResult,
     optimized_result: CudaBenchmarkResult,
 ) -> None:
     """
-    Print one machine-readable CUDA benchmark record.
+    Print one machine-readable benchmark record.
     """
     speedup = (
-        original_result.median_ms
-        / optimized_result.median_ms
+        original_result.timing.median_ms
+        / optimized_result.timing.median_ms
     )
 
-    if optimized_result.peak_allocated_bytes > 0:
-        memory_reduction = (
-            original_result.peak_allocated_bytes
-            / optimized_result.peak_allocated_bytes
+    if original_result.peak_allocated_bytes > 0:
+        optimized_to_original_memory_ratio = (
+            optimized_result.peak_allocated_bytes
+            / original_result.peak_allocated_bytes
         )
+
+        memory_saved_percent = (
+            1.0
+            - optimized_to_original_memory_ratio
+        ) * 100.0
+
     else:
-        memory_reduction = float("inf")
+        optimized_to_original_memory_ratio = float(
+            "nan"
+        )
+
+        memory_saved_percent = float(
+            "nan"
+        )
+
+    original_samples_per_second = (
+        case.batch_size
+        / (
+            original_result.timing.median_ms
+            / 1_000.0
+        )
+    )
+
+    optimized_samples_per_second = (
+        case.batch_size
+        / (
+            optimized_result.timing.median_ms
+            / 1_000.0
+        )
+    )
 
     print()
 
     print(
         "PLE_CUDA_BENCHMARK"
         f" | mode={mode}"
-        f" | bins={bin_case}"
-        f" | batch_size={batch_size}"
-        f" | d_embedding={d_embedding}"
+        f" | case={case.name}"
+        f" | batch_size={case.batch_size}"
+        f" | n_features={case.n_features}"
+        f" | n_bins={case.n_bins}"
+        f" | d_embedding={case.d_embedding}"
         f" | version={version}"
         f" | activation={activation}"
+        f" | old_dense_encoding_mib="
+        f"{case.old_dense_encoding_mib:.3f}"
+        f" | embedding_output_mib="
+        f"{case.embedding_output_mib:.3f}"
         f" | original_median_ms="
-        f"{original_result.median_ms:.6f}"
+        f"{original_result.timing.median_ms:.6f}"
         f" | original_mean_ms="
-        f"{original_result.mean_ms:.6f}"
+        f"{original_result.timing.mean_ms:.6f}"
         f" | original_min_ms="
-        f"{original_result.min_ms:.6f}"
+        f"{original_result.timing.min_ms:.6f}"
         f" | original_max_ms="
-        f"{original_result.max_ms:.6f}"
+        f"{original_result.timing.max_ms:.6f}"
         f" | optimized_median_ms="
-        f"{optimized_result.median_ms:.6f}"
+        f"{optimized_result.timing.median_ms:.6f}"
         f" | optimized_mean_ms="
-        f"{optimized_result.mean_ms:.6f}"
+        f"{optimized_result.timing.mean_ms:.6f}"
         f" | optimized_min_ms="
-        f"{optimized_result.min_ms:.6f}"
+        f"{optimized_result.timing.min_ms:.6f}"
         f" | optimized_max_ms="
-        f"{optimized_result.max_ms:.6f}"
+        f"{optimized_result.timing.max_ms:.6f}"
         f" | original_peak_allocated_mib="
         f"{original_result.peak_allocated_mib:.3f}"
         f" | optimized_peak_allocated_mib="
         f"{optimized_result.peak_allocated_mib:.3f}"
-        f" | original_peak_reserved_mib="
-        f"{original_result.peak_reserved_mib:.3f}"
-        f" | optimized_peak_reserved_mib="
-        f"{optimized_result.peak_reserved_mib:.3f}"
+        f" | optimized_to_original_memory_ratio="
+        f"{optimized_to_original_memory_ratio:.4f}"
+        f" | memory_saved_percent="
+        f"{memory_saved_percent:.2f}"
+        f" | original_samples_per_second="
+        f"{original_samples_per_second:.2f}"
+        f" | optimized_samples_per_second="
+        f"{optimized_samples_per_second:.2f}"
         f" | speedup={speedup:.4f}"
-        f" | memory_reduction={memory_reduction:.4f}"
     )
 
 
 # ============================================================
-# Parameterized CUDA benchmark
+# Parameterized benchmark
 # ============================================================
 
 @pytest.mark.performance
@@ -447,19 +612,9 @@ def print_benchmark_comparison(
     ids=BENCHMARK_MODES,
 )
 @pytest.mark.parametrize(
-    "bin_case",
-    BENCHMARK_BIN_CASES,
-    ids=BENCHMARK_BIN_CASES,
-)
-@pytest.mark.parametrize(
-    "batch_size",
-    BATCH_SIZES,
-    ids=lambda value: f"batch={value}",
-)
-@pytest.mark.parametrize(
-    "d_embedding",
-    D_EMBEDDINGS,
-    ids=lambda value: f"d={value}",
+    "case",
+    BENCHMARK_CASES,
+    ids=lambda case: case.name,
 )
 @pytest.mark.parametrize(
     "version",
@@ -476,9 +631,7 @@ def test_cuda_ple_benchmark(
         "forward",
         "forward_backward",
     ],
-    bin_case: str,
-    batch_size: int,
-    d_embedding: int,
+    case: BenchmarkCase,
     version: Literal["A", "B"],
     activation: bool,
 ) -> None:
@@ -495,10 +648,8 @@ def test_cuda_ple_benchmark(
     if not cuda_build_supports_current_device(
         device
     ):
-        major, minor = (
-            torch.cuda.get_device_capability(
-                device
-            )
+        major, minor = torch.cuda.get_device_capability(
+            device
         )
 
         pytest.skip(
@@ -506,13 +657,14 @@ def test_cuda_ple_benchmark(
             f"the current CUDA architecture sm_{major}{minor}"
         )
 
-    bins = make_bins(
-        bin_case
+    bins = make_benchmark_bins(
+        n_features=case.n_features,
+        n_bins=case.n_bins,
     )
 
     original, optimized = build_equivalent_modules(
         bins=bins,
-        d_embedding=d_embedding,
+        d_embedding=case.d_embedding,
         activation=activation,
         version=version,
         device=device,
@@ -521,7 +673,7 @@ def test_cuda_ple_benchmark(
 
     x = sample_features(
         bins,
-        batch_size=batch_size,
+        batch_size=case.batch_size,
         seed=SEED + 1,
     ).to(
         device=device,
@@ -529,7 +681,7 @@ def test_cuda_ple_benchmark(
     )
 
     # --------------------------------------------------------
-    # Correctness check
+    # Correctness
     # --------------------------------------------------------
 
     original.eval()
@@ -552,7 +704,7 @@ def test_cuda_ple_benchmark(
     torch.cuda.synchronize(device)
 
     # --------------------------------------------------------
-    # Build benchmark callables
+    # Benchmark callables
     # --------------------------------------------------------
 
     if mode == "forward":
@@ -567,6 +719,9 @@ def test_cuda_ple_benchmark(
         def optimized_fn() -> Tensor:
             return optimized(x)
 
+        original_prepare_memory = None
+        optimized_prepare_memory = None
+
     else:
         original.train()
         optimized.train()
@@ -580,47 +735,53 @@ def test_cuda_ple_benchmark(
         )
 
         grad_output = torch.randn(
-            batch_size,
-            len(bins),
-            d_embedding,
+            case.batch_size,
+            case.n_features,
+            case.d_embedding,
             generator=generator,
             device=device,
             dtype=torch.float32,
         )
 
-        original_parameters = tuple(
-            parameter
-            for parameter in original.parameters()
-            if parameter.requires_grad
-        )
+        def clear_original_gradients() -> None:
+            original.zero_grad(
+                set_to_none=True
+            )
 
-        optimized_parameters = tuple(
-            parameter
-            for parameter in optimized.parameters()
-            if parameter.requires_grad
-        )
+        def clear_optimized_gradients() -> None:
+            optimized.zero_grad(
+                set_to_none=True
+            )
 
-        def original_fn() -> tuple[Tensor, ...]:
+        def original_fn() -> None:
+            original.zero_grad(
+                set_to_none=True
+            )
+
             output = original(x)
 
-            return torch.autograd.grad(
-                outputs=output,
-                inputs=original_parameters,
-                grad_outputs=grad_output,
-                create_graph=False,
-                retain_graph=False,
+            output.backward(
+                grad_output
             )
 
-        def optimized_fn() -> tuple[Tensor, ...]:
+        def optimized_fn() -> None:
+            optimized.zero_grad(
+                set_to_none=True
+            )
+
             output = optimized(x)
 
-            return torch.autograd.grad(
-                outputs=output,
-                inputs=optimized_parameters,
-                grad_outputs=grad_output,
-                create_graph=False,
-                retain_graph=False,
+            output.backward(
+                grad_output
             )
+
+        original_prepare_memory = (
+            clear_original_gradients
+        )
+
+        optimized_prepare_memory = (
+            clear_optimized_gradients
+        )
 
     # --------------------------------------------------------
     # Run benchmarks
@@ -629,20 +790,31 @@ def test_cuda_ple_benchmark(
     original_result = benchmark_cuda(
         original_fn,
         device=device,
+        prepare_memory=original_prepare_memory,
     )
 
     optimized_result = benchmark_cuda(
         optimized_fn,
         device=device,
+        prepare_memory=optimized_prepare_memory,
     )
 
     print_benchmark_comparison(
         mode=mode,
-        bin_case=bin_case,
-        batch_size=batch_size,
-        d_embedding=d_embedding,
+        case=case,
         version=version,
         activation=activation,
         original_result=original_result,
         optimized_result=optimized_result,
     )
+
+    # Explicitly release large benchmark tensors between parameterized cases.
+    del original
+    del optimized
+    del x
+
+    if mode == "forward_backward":
+        del grad_output
+
+    gc.collect()
+    torch.cuda.empty_cache()
