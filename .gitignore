@@ -1,0 +1,43 @@
+```gitignore
+# Python bytecode and cache directories
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Pytest cache
+.pytest_cache/
+
+# Coverage cache and reports
+.coverage
+.coverage.*
+htmlcov/
+coverage.xml
+
+# Type checker caches
+.mypy_cache/
+.pyright/
+.pyre/
+
+# Linter and formatter caches
+.ruff_cache/
+
+# Jupyter checkpoints
+.ipynb_checkpoints/
+
+# Build artifacts
+build/
+dist/
+*.egg-info/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# IDE files
+.idea/
+.vscode/
+
+# macOS
+.DS_Store
+```
