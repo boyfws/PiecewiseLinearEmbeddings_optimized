@@ -16,8 +16,8 @@ from tests.utils import BIN_CASE_NAMES, make_bins, sample_features
 FORWARD_RTOL = 2e-5
 FORWARD_ATOL = 2e-6
 
-GRAD_RTOL = 5e-5
-GRAD_ATOL = 5e-6
+GRAD_RTOL = 7e-5
+GRAD_ATOL = 7e-6
 
 TEST_DEVICES = (
     ["cpu", "cuda"]

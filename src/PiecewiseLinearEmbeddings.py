@@ -414,7 +414,7 @@ class OptimizedPiecewiseLinearEmbeddings(nn.Module):
         values_by_feature = (
             x.transpose(0, 1)
             .contiguous()
-            .to(dtype=torch.float32)
+            #.to(dtype=torch.float32)
         )
 
         # [F, N], int32
