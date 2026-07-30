@@ -3,7 +3,10 @@ from typing import Literal, Optional
 
 import torch
 import torch.nn.functional as F
-from rtdl_num_embeddings import _check_bins
+from rtdl_num_embeddings import (
+    _NLinear,
+    _check_bins,
+)
 from torch import Tensor, nn
 from torch.nn.parameter import Parameter
 
@@ -248,65 +251,107 @@ class OptimizedPiecewiseLinearEmbeddings(nn.Module):
         # Feature 2 uses anchors [4:8]
         # -----------------------------------------------------
 
-        anchor_offsets_list: list[int] = []
-
-        current_offset = 0
-
-        for feature_n_bins in n_bins_list:
-            anchor_offsets_list.append(
-                current_offset
-            )
-
-            current_offset += feature_n_bins
+        # -----------------------------------------------------
+        # Offsets into the temporary padded anchor tensor.
+        #
+        # Unlike the previous ragged representation, every
+        # feature occupies max_n_bins positions.
+        # -----------------------------------------------------
 
         self.register_buffer(
             "anchor_offsets",
-            torch.tensor(
-                anchor_offsets_list,
-                dtype=torch.int32,
-                device=base_device,
+            (
+                torch.arange(
+                    self.n_features,
+                    dtype=torch.int32,
+                    device=base_device,
+                )
+                * self.max_n_bins
             ),
         )
 
         # -----------------------------------------------------
-        # Trainable right anchors.
+        # Map local bin indices to the parameter layout used by
+        # the original PiecewiseLinearEmbeddings.
         #
-        # There is no padding and no fixed zero anchor stored here.
-        # The left anchor of the first bin is implicitly zero.
+        # Original layout for a feature with n_bins < max_n_bins:
+        #
+        #   [first bins..., padding..., last bin]
+        #
+        # The last real bin always uses channel max_n_bins - 1.
         # -----------------------------------------------------
 
-        self.anchors = Parameter(
-            torch.empty(
-                self.total_n_bins,
-                d_embedding,
+        real_weight_indices = (
+            torch.arange(
+                self.max_n_bins,
+                dtype=torch.int32,
                 device=base_device,
             )
+            .unsqueeze(0)
+            .expand(
+                self.n_features,
+                -1,
+            )
+            .clone()
         )
+
+        real_weight_indices.add_(
+            (
+                torch.arange(
+                    self.n_features,
+                    dtype=torch.int32,
+                    device=base_device,
+                )
+                * self.max_n_bins
+            ).unsqueeze(1)
+        )
+
+        for feature_idx, feature_n_bins in enumerate(
+            self._n_bins_list
+        ):
+            real_weight_indices[
+                feature_idx,
+                feature_n_bins - 1,
+            ] = (
+                feature_idx * self.max_n_bins
+                + self.max_n_bins
+                - 1
+            )
+
+        self.register_buffer(
+            "real_weight_indices",
+            real_weight_indices,
+        )
+
+        # -----------------------------------------------------
+        # Trainable parameters have the same names and shapes
+        # as in the original PiecewiseLinearEmbeddings.
+        # -----------------------------------------------------
 
         is_version_b = version == "B"
 
-        self.bias: Optional[Parameter]
-
-        if is_version_b:
-            self.register_parameter(
-                "bias",
-                None,
-            )
-
-            self.linear0 = _FeatureLinearEmbedding(
+        self.linear0 = (
+            _FeatureLinearEmbedding(
                 self.n_features,
                 d_embedding,
-            )
-        else:
-            self.bias = Parameter(
-                torch.empty(
-                    self.n_features,
-                    d_embedding,
-                    device=base_device,
-                )
-            )
+            ).to(device=base_device)
+            if is_version_b
+            else None
+        )
 
-            self.linear0 = None
+        self.linear = _NLinear(
+            self.n_features,
+            self.max_n_bins,
+            d_embedding,
+            bias=not is_version_b,
+        ).to(device=base_device)
+
+        if is_version_b:
+            # Same initialization as in the original version B:
+            # initially only the ordinary linear component is active.
+            nn.init.zeros_(
+                self.linear.weight
+            )
 
         self.activation = (
             nn.ReLU()
@@ -314,70 +359,16 @@ class OptimizedPiecewiseLinearEmbeddings(nn.Module):
             else None
         )
 
-        self.reset_parameters()
-
-    def _apply(self, fn):
-        """
-        Apply device/dtype transformations while keeping bin data in float32.
-
-        Calling module.half() or module.bfloat16() changes trainable parameters,
-        but the bin search and position computation remain in float32.
-        """
-        super()._apply(fn)
-
-        self.bin_edges = self.bin_edges.float()
-        self.bin_widths = self.bin_widths.float()
-
-        return self
 
     def reset_parameters(self) -> None:
-        """
-        Initialize anchors through random bin increments.
+        if self.linear0 is not None:
+            self.linear0.reset_parameters()
 
-        This preserves the functional initialization style of the original
-        implementation, where every bin stores an independent increment.
-        """
+        self.linear.reset_parameters()
+
         if self.version == "B":
-            nn.init.zeros_(self.anchors)
-
-        else:
-            bound = self.max_n_bins ** -0.5
-
-            with torch.no_grad():
-                current_offset = 0
-
-                for feature_n_bins in self._n_bins_list:
-                    increments = torch.empty(
-                        feature_n_bins,
-                        self.d_embedding,
-                        device=self.anchors.device,
-                        dtype=self.anchors.dtype,
-                    )
-
-                    nn.init.uniform_(
-                        increments,
-                        -bound,
-                        bound,
-                    )
-
-                    anchors = torch.cumsum(
-                        increments,
-                        dim=0,
-                    )
-
-                    self.anchors[
-                        current_offset:
-                        current_offset + feature_n_bins
-                    ].copy_(anchors)
-
-                    current_offset += feature_n_bins
-
-            assert self.bias is not None
-
-            nn.init.uniform_(
-                self.bias,
-                -bound,
-                bound,
+            nn.init.zeros_(
+                self.linear.weight
             )
 
     def get_output_shape(self) -> torch.Size:
@@ -501,7 +492,45 @@ class OptimizedPiecewiseLinearEmbeddings(nn.Module):
             position_by_feature
             .transpose(0, 1)
             .contiguous()
-            .to(dtype=self.anchors.dtype)
+        )
+
+        # -----------------------------------------------------
+        # Extract independent bin weights in local-bin order.
+        #
+        # self.linear.weight follows the original padded layout,
+        # while real_bin_weights follows simple local-bin order:
+        #
+        #   [feature, local_bin, embedding]
+        # -----------------------------------------------------
+
+        real_bin_weights = torch.index_select(
+            self.linear.weight.reshape(
+                -1,
+                self.d_embedding,
+            ),
+            dim=0,
+            index=self.real_weight_indices.reshape(-1),
+        ).view(
+            self.n_features,
+            self.max_n_bins,
+            self.d_embedding,
+        )
+
+        # -----------------------------------------------------
+        # Precompute cumulative right anchors once per forward.
+        #
+        # This tensor depends only on the parameters, not on the
+        # batch size. FP32 accumulation prevents the BF16 collapse
+        # of neighbouring cumulative anchors.
+        # -----------------------------------------------------
+
+        right_anchors = torch.cumsum(
+            real_bin_weights,
+            dim=1,
+            #dtype=torch.float32, # Inheritate data type of real_bin_weights
+        ).reshape(
+            -1,
+            self.d_embedding,
         )
 
         # -----------------------------------------------------
@@ -590,7 +619,7 @@ class OptimizedPiecewiseLinearEmbeddings(nn.Module):
 
         x_ple = F.embedding_bag(
             input=anchor_indices,
-            weight=self.anchors,
+            weight=right_anchors,
             offsets=None,
             mode="sum",
             per_sample_weights=anchor_weights,
@@ -601,8 +630,8 @@ class OptimizedPiecewiseLinearEmbeddings(nn.Module):
             self.d_embedding,
         )
 
-        if self.bias is not None:
-            x_ple = x_ple + self.bias
+        if self.linear.bias is not None:
+            x_ple = x_ple + self.linear.bias
 
         if self.activation is not None:
             x_ple = self.activation(x_ple)
