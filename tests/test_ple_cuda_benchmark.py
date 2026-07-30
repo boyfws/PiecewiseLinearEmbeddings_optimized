@@ -30,22 +30,36 @@ from tests.utils import sample_features
 # General configuration
 # ============================================================
 
-# This benchmark is AMP BF16 only:
-#   - model parameters and floating-point buffers stay float32;
-#   - benchmark inputs stay float32;
-#   - forward runs under CUDA autocast(dtype=torch.bfloat16);
-#   - backward runs after leaving the autocast context;
-#   - GradScaler is intentionally not used for BF16.
+# This benchmark compares two precision modes:
+#
+#   float32:
+#       - model parameters and floating-point buffers stay float32;
+#       - benchmark inputs stay float32;
+#       - forward runs without autocast.
+#
+#   amp_bfloat16:
+#       - model parameters and floating-point buffers stay float32;
+#       - benchmark inputs stay float32;
+#       - forward runs under CUDA autocast(dtype=torch.bfloat16);
+#       - backward runs after leaving the autocast context;
+#       - GradScaler is intentionally not used for BF16.
 
 SEED = 42
 
+FP32_PRECISION_NAME = "float32"
 AMP_DTYPE = torch.bfloat16
 AMP_PRECISION_NAME = "amp_bfloat16"
 
-# The original and optimized implementations use different kernels under AMP.
-# A small number of values may therefore differ by one BF16 quantization step.
-FORWARD_RTOL = 5e-2
-FORWARD_ATOL = 1.25e-1
+FORWARD_TOLERANCES: dict[
+    str,
+    tuple[float, float],
+] = {
+    "float32": (2e-4, 2e-5),
+    # The original and optimized implementations use different kernels under
+    # AMP. A very small number of values may differ by one BF16 quantization
+    # step even though model parameters and inputs remain float32.
+    "amp_bfloat16": (5e-2, 1.25e-1),
+}
 
 # torch.compile is lazy. These calls happen before timing and are intended to:
 #   1. compile forward and, when needed, backward;
@@ -85,9 +99,10 @@ BENCHMARK_MODES: tuple[
 )
 
 BENCHMARK_PRECISIONS: tuple[
-    Literal["amp_bfloat16"],
+    Literal["float32", "amp_bfloat16"],
     ...,
 ] = (
+    FP32_PRECISION_NAME,
     AMP_PRECISION_NAME,
 )
 
@@ -142,6 +157,34 @@ class AmpBFloat16Module(nn.Module):
             dtype=AMP_DTYPE,
         ):
             return self.module(x)
+
+
+def prepare_module_for_precision(
+    module: nn.Module,
+    *,
+    precision_name: Literal["float32", "amp_bfloat16"],
+) -> nn.Module:
+    """Return the module execution wrapper for the requested precision."""
+    if precision_name == FP32_PRECISION_NAME:
+        return module
+
+    if precision_name == AMP_PRECISION_NAME:
+        return AmpBFloat16Module(module)
+
+    raise ValueError(
+        f"Unsupported precision: {precision_name}"
+    )
+
+
+def get_forward_tolerances(
+    precision_name: Literal["float32", "amp_bfloat16"],
+) -> tuple[float, float]:
+    try:
+        return FORWARD_TOLERANCES[precision_name]
+    except KeyError as error:
+        raise ValueError(
+            f"Unsupported precision: {precision_name}"
+        ) from error
 
 
 # ============================================================
@@ -372,7 +415,7 @@ def build_equivalent_modules(
         linear0.bias     # version B only
 
     Parameters, floating-point buffers, and benchmark inputs remain float32.
-    AMP BF16 is applied only around forward calls by AmpBFloat16Module.
+    The selected precision mode is applied later through an execution wrapper.
     """
     original = PiecewiseLinearEmbeddings(
         bins=bins,
@@ -1098,7 +1141,7 @@ def print_benchmark_comparison(
     case: BenchmarkCase,
     version: str,
     activation: bool,
-    precision_name: str,
+    precision_name: Literal["float32", "amp_bfloat16"],
     execution: ExecutionConfig,
     measurement_order: tuple[str, str],
     original_output_dtype: torch.dtype,
@@ -1148,6 +1191,12 @@ def print_benchmark_comparison(
         )
     )
 
+    autocast_dtype_name = (
+        "bfloat16"
+        if precision_name == AMP_PRECISION_NAME
+        else "none"
+    )
+
     print()
 
     print(
@@ -1159,7 +1208,8 @@ def print_benchmark_comparison(
         f" | compile_fullgraph={COMPILE_FULLGRAPH}"
         f" | precision={precision_name}"
         f" | parameter_dtype=float32"
-        f" | autocast_dtype=bfloat16"
+        f" | input_dtype=float32"
+        f" | autocast_dtype={autocast_dtype_name}"
         f" | original_output_dtype={original_output_dtype}"
         f" | optimized_output_dtype={optimized_output_dtype}"
         f" | measurement_order={measurement_order[0]},{measurement_order[1]}"
@@ -1260,7 +1310,7 @@ def test_cuda_ple_benchmark(
     case: BenchmarkCase,
     version: Literal["A", "B"],
     activation: bool,
-    precision_name: Literal["amp_bfloat16"],
+    precision_name: Literal["float32", "amp_bfloat16"],
     execution: ExecutionConfig,
 ) -> None:
     if not torch.cuda.is_available():
@@ -1283,12 +1333,18 @@ def test_cuda_ple_benchmark(
             f"the current CUDA architecture sm_{major}{minor}"
         )
 
-    if not torch.cuda.is_bf16_supported():
+    if (
+        precision_name == AMP_PRECISION_NAME
+        and not torch.cuda.is_bf16_supported()
+    ):
         pytest.skip(
             "The current CUDA device does not support bfloat16"
         )
 
-    if precision_name != AMP_PRECISION_NAME:
+    if precision_name not in {
+        FP32_PRECISION_NAME,
+        AMP_PRECISION_NAME,
+    }:
         raise ValueError(
             f"Unsupported precision: {precision_name}"
         )
@@ -1307,8 +1363,15 @@ def test_cuda_ple_benchmark(
         seed=SEED,
     )
 
-    original = AmpBFloat16Module(original)
-    optimized = AmpBFloat16Module(optimized)
+    original = prepare_module_for_precision(
+        original,
+        precision_name=precision_name,
+    )
+
+    optimized = prepare_module_for_precision(
+        optimized,
+        precision_name=precision_name,
+    )
 
     x = sample_features(
         bins,
@@ -1347,11 +1410,17 @@ def test_cuda_ple_benchmark(
     original_output_dtype = expected.dtype
     optimized_output_dtype = actual.dtype
 
+    forward_rtol, forward_atol = (
+        get_forward_tolerances(
+            precision_name
+        )
+    )
+
     torch.testing.assert_close(
         actual.float(),
         expected.float(),
-        rtol=FORWARD_RTOL,
-        atol=FORWARD_ATOL,
+        rtol=forward_rtol,
+        atol=forward_atol,
     )
 
     del expected
