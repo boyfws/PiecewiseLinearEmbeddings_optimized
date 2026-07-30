@@ -23,10 +23,7 @@ from rtdl_num_embeddings import PiecewiseLinearEmbeddings
 from src.PiecewiseLinearEmbeddings import (
     OptimizedPiecewiseLinearEmbeddings,
 )
-from tests.utils import (
-    convert_old_ple_state_dict,
-    sample_features,
-)
+from tests.utils import sample_features
 
 
 # ============================================================
@@ -356,9 +353,17 @@ def build_equivalent_modules(
     """
     Build functionally equivalent original and optimized modules.
 
-    Parameters are initialized and converted in float32 first. Both modules are
-    cast to the benchmark dtype only after the converted state is loaded. This
-    keeps the parameter conversion identical for float32 and bfloat16 tests.
+    The optimized implementation now uses the same trainable-parameter layout
+    as the original implementation:
+
+        linear.weight
+        linear.bias      # version A only
+        linear0.weight   # version B only
+        linear0.bias     # version B only
+
+    Parameters are initialized and copied in float32. Both modules are cast to
+    the benchmark dtype only after the direct parameter transfer, so float32
+    and bfloat16 benchmarks start from identically rounded trainable weights.
     """
     original = PiecewiseLinearEmbeddings(
         bins=bins,
@@ -385,19 +390,46 @@ def build_equivalent_modules(
         seed=seed,
     )
 
-    converted_state_dict = convert_old_ple_state_dict(
-        original.state_dict()
+    # The new optimized format matches the original trainable layout,
+    # so no state-dict conversion or anchor reconstruction is required.
+    optimized.linear.load_state_dict(
+        original.linear.state_dict(),
+        strict=True,
     )
 
-    load_result = optimized.load_state_dict(
-        converted_state_dict,
-        strict=False,
-    )
+    if original.linear0 is None:
+        if optimized.linear0 is not None:
+            raise RuntimeError(
+                "The optimized module unexpectedly has linear0 "
+                f"for version={version}"
+            )
+    else:
+        if optimized.linear0 is None:
+            raise RuntimeError(
+                "The optimized module is missing linear0 "
+                f"for version={version}"
+            )
 
-    if load_result.unexpected_keys:
+        optimized.linear0.load_state_dict(
+            original.linear0.state_dict(),
+            strict=True,
+        )
+
+    original_parameter_layout = {
+        name: tuple(parameter.shape)
+        for name, parameter in original.named_parameters()
+    }
+
+    optimized_parameter_layout = {
+        name: tuple(parameter.shape)
+        for name, parameter in optimized.named_parameters()
+    }
+
+    if optimized_parameter_layout != original_parameter_layout:
         raise RuntimeError(
-            "Unexpected keys while loading the converted state dict: "
-            f"{load_result.unexpected_keys}"
+            "Original and optimized trainable-parameter layouts differ: "
+            f"original={original_parameter_layout}, "
+            f"optimized={optimized_parameter_layout}"
         )
 
     original = original.to(dtype=dtype)

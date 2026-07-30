@@ -1,30 +1,29 @@
 import pathlib
 import sys
+from typing import Literal
 
 sys.path.append(str(pathlib.Path(__file__).resolve().parent.parent))
 
-from collections.abc import Sequence
-
 import pytest
 import torch
-from torch import Tensor, nn
+from torch import Tensor
 
 from rtdl_num_embeddings import PiecewiseLinearEmbeddings
 from src.PiecewiseLinearEmbeddings import OptimizedPiecewiseLinearEmbeddings
-from tests.utils import convert_old_ple_state_dict, sample_features, make_bins, BIN_CASE_NAMES
+from tests.utils import BIN_CASE_NAMES, make_bins, sample_features
 
-from typing import Literal
 
 FORWARD_RTOL = 2e-5
 FORWARD_ATOL = 2e-6
 
-
 GRAD_RTOL = 5e-5
 GRAD_ATOL = 5e-6
 
-
-TEST_DEVICES = ["cpu", "cuda"] if torch.cuda.is_available() else ["cpu"]
-
+TEST_DEVICES = (
+    ["cpu", "cuda"]
+    if torch.cuda.is_available()
+    else ["cpu"]
+)
 
 D_EMBEDDING_VALUES = (10, 15, 20)
 SEED_VALUES = (42, 0, 1)
@@ -64,7 +63,6 @@ def initialize_original_parameters_(
         )
 
 
-
 def build_equivalent_modules(
     *,
     bins: list[Tensor],
@@ -72,14 +70,14 @@ def build_equivalent_modules(
     activation: bool,
     version: Literal["A", "B"],
     device: str,
-    seed: int 
+    seed: int,
 ) -> tuple[
     PiecewiseLinearEmbeddings,
     OptimizedPiecewiseLinearEmbeddings,
 ]:
     """
-    Build the original and optimized modules and transfer the represented
-    function through state-dict conversion.
+    Build the original and optimized modules and copy trainable parameters
+    directly through the common linear/linear0 API.
     """
     original = PiecewiseLinearEmbeddings(
         bins=bins,
@@ -106,122 +104,33 @@ def build_equivalent_modules(
         seed=seed,
     )
 
-    converted_state_dict = convert_old_ple_state_dict(
-        original.state_dict()
+    # The optimized implementation must expose the same trainable API.
+    assert set(dict(optimized.named_parameters())) == set(
+        dict(original.named_parameters())
     )
 
-    load_result = optimized.load_state_dict(
-        converted_state_dict,
-        strict=False,
+    optimized.linear.load_state_dict(
+        original.linear.state_dict(),
+        strict=True,
     )
 
+    if original.linear0 is None:
+        assert optimized.linear0 is None
+    else:
+        assert optimized.linear0 is not None
+
+        optimized.linear0.load_state_dict(
+            original.linear0.state_dict(),
+            strict=True,
+        )
 
     return original, optimized
 
 
 # ============================================================
-# Gradient conversion
-# ============================================================
-
-def convert_anchor_grad_to_old_weight_layout(
-    *,
-    anchor_grad: Tensor,
-    n_bins_per_feature: Sequence[int],
-    old_weight_shape: torch.Size,
-) -> Tensor:
-    """
-    Convert gradients with respect to anchors into gradients with respect
-    to the original bin increments.
-
-    For one feature:
-
-        anchor[j] = sum(increment[k] for k <= j)
-
-    Therefore:
-
-        grad_increment[k] = sum(grad_anchor[j] for j >= k)
-
-    The returned tensor follows the original physical layout, where the last
-    real bin is always stored at the final max-bin position.
-    """
-    if anchor_grad.ndim != 2:
-        raise ValueError(
-            "anchor_grad must have shape "
-            "[sum(n_bins_per_feature), d_embedding]"
-        )
-
-    n_features, max_n_bins, d_embedding = old_weight_shape
-
-    if len(n_bins_per_feature) != n_features:
-        raise ValueError(
-            "n_bins_per_feature must contain one value per feature"
-        )
-
-    result = torch.zeros(
-        old_weight_shape,
-        dtype=anchor_grad.dtype,
-        device=anchor_grad.device,
-    )
-
-    source_offset = 0
-
-    for feature_idx, feature_n_bins in enumerate(
-        n_bins_per_feature
-    ):
-        feature_anchor_grad = anchor_grad[
-            source_offset:
-            source_offset + feature_n_bins
-        ]
-
-        # Reverse cumulative sum:
-        # grad_increment[k] = sum_{j >= k} grad_anchor[j]
-        logical_increment_grad = torch.flip(
-            torch.cumsum(
-                torch.flip(
-                    feature_anchor_grad,
-                    dims=(0,),
-                ),
-                dim=0,
-            ),
-            dims=(0,),
-        )
-
-        if feature_n_bins == 1:
-            result[
-                feature_idx,
-                -1,
-            ] = logical_increment_grad[0]
-
-        elif feature_n_bins == max_n_bins:
-            result[
-                feature_idx
-            ] = logical_increment_grad
-
-        else:
-            result[
-                feature_idx,
-                :feature_n_bins - 1,
-            ] = logical_increment_grad[:-1]
-
-            result[
-                feature_idx,
-                -1,
-            ] = logical_increment_grad[-1]
-
-        source_offset += feature_n_bins
-
-    if source_offset != anchor_grad.shape[0]:
-        raise ValueError(
-            "The anchor gradient size does not match "
-            "n_bins_per_feature"
-        )
-
-    return result
-
-
-# ============================================================
 # Forward tests
 # ============================================================
+
 
 @pytest.mark.parametrize(
     "device",
@@ -253,10 +162,10 @@ def test_forward_matches_original(
     version: Literal["A", "B"],
     activation: bool,
     seed: int,
-    d_embedding: int
+    d_embedding: int,
 ) -> None:
     bins = make_bins(case_name)
-    
+
     original, optimized = build_equivalent_modules(
         bins=bins,
         d_embedding=d_embedding,
@@ -305,6 +214,7 @@ def test_forward_matches_original(
 # Backward tests
 # ============================================================
 
+
 @pytest.mark.parametrize(
     "device",
     TEST_DEVICES,
@@ -329,13 +239,13 @@ def test_forward_matches_original(
     "d_embedding",
     D_EMBEDDING_VALUES,
 )
-def test_backward_matches_original_after_gradient_mapping(
+def test_backward_matches_original(
     device: str,
     case_name: str,
     version: Literal["A", "B"],
     activation: bool,
     seed: int,
-    d_embedding: int
+    d_embedding: int,
 ) -> None:
     bins = make_bins(case_name)
 
@@ -345,7 +255,7 @@ def test_backward_matches_original_after_gradient_mapping(
         activation=activation,
         version=version,
         device=device,
-        seed=seed
+        seed=seed,
     )
 
     x_base = sample_features(
@@ -367,11 +277,11 @@ def test_backward_matches_original_after_gradient_mapping(
     )
 
     original.zero_grad(
-        set_to_none=True
+        set_to_none=True,
     )
 
     optimized.zero_grad(
-        set_to_none=True
+        set_to_none=True,
     )
 
     output_original = original(
@@ -401,6 +311,9 @@ def test_backward_matches_original_after_gradient_mapping(
         grad_output,
     )
 
+    # --------------------------------------------------------
+    # Input gradients
+    # --------------------------------------------------------
 
     assert x_original.grad is not None
     assert x_optimized.grad is not None
@@ -417,26 +330,13 @@ def test_backward_matches_original_after_gradient_mapping(
     # --------------------------------------------------------
 
     assert original.linear.weight.grad is not None
-    assert optimized.anchors.grad is not None
-
-    n_bins_per_feature = [
-        edges.numel() - 1
-        for edges in bins
-    ]
-
-    mapped_anchor_grad = (
-        convert_anchor_grad_to_old_weight_layout(
-            anchor_grad=optimized.anchors.grad,
-            n_bins_per_feature=n_bins_per_feature,
-            old_weight_shape=original.linear.weight.shape,
-        )
-    )
+    assert optimized.linear.weight.grad is not None
 
     torch.testing.assert_close(
-        mapped_anchor_grad,
+        optimized.linear.weight.grad,
         original.linear.weight.grad,
-        rtol=GRAD_RTOL * 10, # mapped_anchor_grad is a sum of original.linear.weight.grad, so we need to relax the tolerance
-        atol=GRAD_ATOL * 10,
+        rtol=GRAD_RTOL,
+        atol=GRAD_ATOL,
     )
 
     # --------------------------------------------------------
@@ -445,19 +345,25 @@ def test_backward_matches_original_after_gradient_mapping(
 
     if version == "A":
         assert original.linear.bias is not None
-        assert optimized.bias is not None
+        assert optimized.linear.bias is not None
 
         assert original.linear.bias.grad is not None
-        assert optimized.bias.grad is not None
+        assert optimized.linear.bias.grad is not None
 
         torch.testing.assert_close(
-            optimized.bias.grad,
+            optimized.linear.bias.grad,
             original.linear.bias.grad,
             rtol=GRAD_RTOL,
             atol=GRAD_ATOL,
         )
 
+        assert original.linear0 is None
+        assert optimized.linear0 is None
+
     else:
+        assert original.linear.bias is None
+        assert optimized.linear.bias is None
+
         assert original.linear0 is not None
         assert optimized.linear0 is not None
 
@@ -480,8 +386,4 @@ def test_backward_matches_original_after_gradient_mapping(
             rtol=GRAD_RTOL,
             atol=GRAD_ATOL,
         )
-
-
-
-
-
+        
