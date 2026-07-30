@@ -527,7 +527,7 @@ class OptimizedPiecewiseLinearEmbeddings(nn.Module):
         right_anchors = torch.cumsum(
             real_bin_weights,
             dim=1,
-            #dtype=torch.float32, # Inheritate data type of real_bin_weights
+            dtype=torch.float32, 
         ).reshape(
             -1,
             self.d_embedding,
@@ -600,6 +600,7 @@ class OptimizedPiecewiseLinearEmbeddings(nn.Module):
                 2,
             )
             .clone()
+            .to(right_anchors.dtype)
         )
 
         left_weight = anchor_weights[..., 0]
@@ -629,6 +630,8 @@ class OptimizedPiecewiseLinearEmbeddings(nn.Module):
             self.n_features,
             self.d_embedding,
         )
+
+        x_ple = x_ple.to(self.linear.weight.dtype)
 
         if self.linear.bias is not None:
             x_ple = x_ple + self.linear.bias
