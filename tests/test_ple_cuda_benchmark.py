@@ -30,15 +30,22 @@ from tests.utils import sample_features
 # General configuration
 # ============================================================
 
+# This benchmark is AMP BF16 only:
+#   - model parameters and floating-point buffers stay float32;
+#   - benchmark inputs stay float32;
+#   - forward runs under CUDA autocast(dtype=torch.bfloat16);
+#   - backward runs after leaving the autocast context;
+#   - GradScaler is intentionally not used for BF16.
+
 SEED = 42
 
-FORWARD_TOLERANCES: dict[
-    str,
-    tuple[float, float],
-] = {
-    "float32": (2e-4, 2e-5),
-    "bfloat16": (3e-2, 3e-2),
-}
+AMP_DTYPE = torch.bfloat16
+AMP_PRECISION_NAME = "amp_bfloat16"
+
+# The original and optimized implementations use different kernels under AMP.
+# A small number of values may therefore differ by one BF16 quantization step.
+FORWARD_RTOL = 5e-2
+FORWARD_ATOL = 1.25e-1
 
 # torch.compile is lazy. These calls happen before timing and are intended to:
 #   1. compile forward and, when needed, backward;
@@ -77,12 +84,11 @@ BENCHMARK_MODES: tuple[
     "forward_backward",
 )
 
-BENCHMARK_DTYPES: tuple[
-    Literal["float32", "bfloat16"],
+BENCHMARK_PRECISIONS: tuple[
+    Literal["amp_bfloat16"],
     ...,
 ] = (
-    "float32",
-    "bfloat16",
+    AMP_PRECISION_NAME,
 )
 
 
@@ -119,6 +125,23 @@ BENCHMARK_EXECUTIONS = (
         compile_mode="max-autotune",
     ),
 )
+
+
+class AmpBFloat16Module(nn.Module):
+    """Run a float32 module under CUDA AMP with BF16 autocast."""
+
+    def __init__(self, module: nn.Module) -> None:
+        super().__init__()
+        self.module = module
+
+    def forward(self, x: Tensor) -> Tensor:
+        # Parameters, floating-point buffers, and x remain float32.
+        # Autocast chooses BF16 only for eligible CUDA operations.
+        with torch.autocast(
+            device_type="cuda",
+            dtype=AMP_DTYPE,
+        ):
+            return self.module(x)
 
 
 # ============================================================
@@ -231,18 +254,6 @@ class CudaBenchmarkResult:
 # ============================================================
 
 
-def resolve_dtype(
-    dtype_name: Literal["float32", "bfloat16"],
-) -> torch.dtype:
-    if dtype_name == "float32":
-        return torch.float32
-
-    if dtype_name == "bfloat16":
-        return torch.bfloat16
-
-    raise ValueError(f"Unsupported dtype name: {dtype_name}")
-
-
 def make_benchmark_bins(
     *,
     n_features: int,
@@ -344,7 +355,6 @@ def build_equivalent_modules(
     activation: bool,
     version: Literal["A", "B"],
     device: torch.device,
-    dtype: torch.dtype,
     seed: int,
 ) -> tuple[
     PiecewiseLinearEmbeddings,
@@ -361,9 +371,8 @@ def build_equivalent_modules(
         linear0.weight   # version B only
         linear0.bias     # version B only
 
-    Parameters are initialized and copied in float32. Both modules are cast to
-    the benchmark dtype only after the direct parameter transfer, so float32
-    and bfloat16 benchmarks start from identically rounded trainable weights.
+    Parameters, floating-point buffers, and benchmark inputs remain float32.
+    AMP BF16 is applied only around forward calls by AmpBFloat16Module.
     """
     original = PiecewiseLinearEmbeddings(
         bins=bins,
@@ -432,8 +441,16 @@ def build_equivalent_modules(
             f"optimized={optimized_parameter_layout}"
         )
 
-    original = original.to(dtype=dtype)
-    optimized = optimized.to(dtype=dtype)
+    for module_name, module in (
+        ("original", original),
+        ("optimized", optimized),
+    ):
+        for parameter_name, parameter in module.named_parameters():
+            if parameter.dtype != torch.float32:
+                raise RuntimeError(
+                    f"{module_name}.{parameter_name} must remain float32 "
+                    f"for AMP, got {parameter.dtype}"
+                )
 
     return original, optimized
 
@@ -1034,7 +1051,7 @@ def get_measurement_order(
     case: BenchmarkCase,
     version: str,
     activation: bool,
-    dtype_name: str,
+    precision_name: str,
     execution: ExecutionConfig,
 ) -> tuple[
     Literal["original", "optimized"],
@@ -1048,7 +1065,7 @@ def get_measurement_order(
     """
     seed_material = (
         f"{SEED}|{mode}|{case.name}|{version}|{activation}|"
-        f"{dtype_name}|{execution.name}"
+        f"{precision_name}|{execution.name}"
     )
 
     order_seed = (
@@ -1081,10 +1098,11 @@ def print_benchmark_comparison(
     case: BenchmarkCase,
     version: str,
     activation: bool,
-    dtype_name: str,
-    dtype: torch.dtype,
+    precision_name: str,
     execution: ExecutionConfig,
     measurement_order: tuple[str, str],
+    original_output_dtype: torch.dtype,
+    optimized_output_dtype: torch.dtype,
     original_result: CudaBenchmarkResult,
     optimized_result: CudaBenchmarkResult,
 ) -> None:
@@ -1139,7 +1157,11 @@ def print_benchmark_comparison(
         f" | compile_mode={execution.compile_mode}"
         f" | compile_dynamic={COMPILE_DYNAMIC}"
         f" | compile_fullgraph={COMPILE_FULLGRAPH}"
-        f" | dtype={dtype_name}"
+        f" | precision={precision_name}"
+        f" | parameter_dtype=float32"
+        f" | autocast_dtype=bfloat16"
+        f" | original_output_dtype={original_output_dtype}"
+        f" | optimized_output_dtype={optimized_output_dtype}"
         f" | measurement_order={measurement_order[0]},{measurement_order[1]}"
         f" | case={case.name}"
         f" | batch_size={case.batch_size}"
@@ -1148,10 +1170,12 @@ def print_benchmark_comparison(
         f" | d_embedding={case.d_embedding}"
         f" | version={version}"
         f" | activation={activation}"
-        f" | old_dense_encoding_mib="
-        f"{case.old_dense_encoding_mib(dtype):.3f}"
-        f" | embedding_output_mib="
-        f"{case.embedding_output_mib(dtype):.3f}"
+        f" | old_dense_encoding_fp32_mib="
+        f"{case.old_dense_encoding_mib(torch.float32):.3f}"
+        f" | embedding_output_bfloat16_mib="
+        f"{case.embedding_output_mib(torch.bfloat16):.3f}"
+        f" | embedding_output_fp32_mib="
+        f"{case.embedding_output_mib(torch.float32):.3f}"
         f" | original_median_ms="
         f"{original_result.timing.median_ms:.6f}"
         f" | original_mean_ms="
@@ -1219,9 +1243,9 @@ def print_benchmark_comparison(
     ids=lambda value: f"activation={value}",
 )
 @pytest.mark.parametrize(
-    "dtype_name",
-    BENCHMARK_DTYPES,
-    ids=lambda value: f"dtype={value}",
+    "precision_name",
+    BENCHMARK_PRECISIONS,
+    ids=lambda value: f"precision={value}",
 )
 @pytest.mark.parametrize(
     "execution",
@@ -1236,10 +1260,7 @@ def test_cuda_ple_benchmark(
     case: BenchmarkCase,
     version: Literal["A", "B"],
     activation: bool,
-    dtype_name: Literal[
-        "float32",
-        "bfloat16",
-    ],
+    precision_name: Literal["amp_bfloat16"],
     execution: ExecutionConfig,
 ) -> None:
     if not torch.cuda.is_available():
@@ -1262,15 +1283,15 @@ def test_cuda_ple_benchmark(
             f"the current CUDA architecture sm_{major}{minor}"
         )
 
-    if (
-        dtype_name == "bfloat16"
-        and not torch.cuda.is_bf16_supported()
-    ):
+    if not torch.cuda.is_bf16_supported():
         pytest.skip(
             "The current CUDA device does not support bfloat16"
         )
 
-    dtype = resolve_dtype(dtype_name)
+    if precision_name != AMP_PRECISION_NAME:
+        raise ValueError(
+            f"Unsupported precision: {precision_name}"
+        )
 
     bins = make_benchmark_bins(
         n_features=case.n_features,
@@ -1283,9 +1304,11 @@ def test_cuda_ple_benchmark(
         activation=activation,
         version=version,
         device=device,
-        dtype=dtype,
         seed=SEED,
     )
+
+    original = AmpBFloat16Module(original)
+    optimized = AmpBFloat16Module(optimized)
 
     x = sample_features(
         bins,
@@ -1293,7 +1316,7 @@ def test_cuda_ple_benchmark(
         seed=SEED + 1,
     ).to(
         device=device,
-        dtype=dtype,
+        dtype=torch.float32,
     )
 
     probe_batch_size = max(
@@ -1307,7 +1330,7 @@ def test_cuda_ple_benchmark(
         seed=SEED + 3,
     ).to(
         device=device,
-        dtype=dtype,
+        dtype=torch.float32,
     )
 
     # --------------------------------------------------------
@@ -1321,15 +1344,14 @@ def test_cuda_ple_benchmark(
         expected = original(x)
         actual = optimized(x)
 
-    forward_rtol, forward_atol = (
-        FORWARD_TOLERANCES[dtype_name]
-    )
+    original_output_dtype = expected.dtype
+    optimized_output_dtype = actual.dtype
 
     torch.testing.assert_close(
         actual.float(),
         expected.float(),
-        rtol=forward_rtol,
-        atol=forward_atol,
+        rtol=FORWARD_RTOL,
+        atol=FORWARD_ATOL,
     )
 
     del expected
@@ -1341,8 +1363,15 @@ def test_cuda_ple_benchmark(
     # Backward tensors
     # --------------------------------------------------------
 
-    grad_output: Tensor | None = None
-    probe_grad_output: Tensor | None = None
+    grad_outputs: dict[str, Tensor | None] = {
+        "original": None,
+        "optimized": None,
+    }
+
+    probe_grad_outputs: dict[str, Tensor | None] = {
+        "original": None,
+        "optimized": None,
+    }
 
     if mode == "forward_backward":
         generator = torch.Generator(
@@ -1353,23 +1382,44 @@ def test_cuda_ple_benchmark(
             SEED + 2
         )
 
-        grad_output = torch.randn(
+        base_grad_output = torch.randn(
             case.batch_size,
             case.n_features,
             case.d_embedding,
             generator=generator,
             device=device,
-            dtype=dtype,
+            dtype=torch.float32,
         )
 
-        probe_grad_output = torch.randn(
+        base_probe_grad_output = torch.randn(
             probe_batch_size,
             case.n_features,
             case.d_embedding,
             generator=generator,
             device=device,
-            dtype=dtype,
+            dtype=torch.float32,
         )
+
+        grad_outputs = {
+            "original": base_grad_output.to(
+                dtype=original_output_dtype,
+            ),
+            "optimized": base_grad_output.to(
+                dtype=optimized_output_dtype,
+            ),
+        }
+
+        probe_grad_outputs = {
+            "original": base_probe_grad_output.to(
+                dtype=original_output_dtype,
+            ),
+            "optimized": base_probe_grad_output.to(
+                dtype=optimized_output_dtype,
+            ),
+        }
+
+        del base_grad_output
+        del base_probe_grad_output
 
     # --------------------------------------------------------
     # Deterministically randomized measurement order
@@ -1380,7 +1430,7 @@ def test_cuda_ple_benchmark(
         case=case,
         version=version,
         activation=activation,
-        dtype_name=dtype_name,
+        precision_name=precision_name,
         execution=execution,
     )
 
@@ -1397,9 +1447,9 @@ def test_cuda_ple_benchmark(
             execution=execution,
             mode=mode,
             x=x,
-            grad_output=grad_output,
+            grad_output=grad_outputs[implementation_name],
             probe_x=probe_x,
-            probe_grad_output=probe_grad_output,
+            probe_grad_output=probe_grad_outputs[implementation_name],
             device=device,
         )
 
@@ -1411,10 +1461,11 @@ def test_cuda_ple_benchmark(
         case=case,
         version=version,
         activation=activation,
-        dtype_name=dtype_name,
-        dtype=dtype,
+        precision_name=precision_name,
         execution=execution,
         measurement_order=measurement_order,
+        original_output_dtype=original_output_dtype,
+        optimized_output_dtype=optimized_output_dtype,
         original_result=original_result,
         optimized_result=optimized_result,
     )
@@ -1428,11 +1479,8 @@ def test_cuda_ple_benchmark(
     del x
     del probe_x
 
-    if grad_output is not None:
-        del grad_output
-
-    if probe_grad_output is not None:
-        del probe_grad_output
+    del grad_outputs
+    del probe_grad_outputs
 
     reset_compiler_state()
     gc.collect()
