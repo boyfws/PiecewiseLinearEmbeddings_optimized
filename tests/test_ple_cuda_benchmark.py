@@ -134,11 +134,7 @@ BENCHMARK_EXECUTIONS = (
     ExecutionConfig(
         name="compile_default",
         compile_mode="default",
-    ),
-    ExecutionConfig(
-        name="compile_max_autotune",
-        compile_mode="max-autotune",
-    ),
+    )
 )
 
 
