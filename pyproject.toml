@@ -1,0 +1,32 @@
+[build-system]
+requires = [
+    "setuptools>=68",
+    "wheel",
+    "torch>=2.4",
+]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "rtdl-num-embeddings-cuda"
+version = "0.2.0.dev0"
+description = "Fused CUDA forward and backward kernels for rtdl_num_embeddings piecewise-linear embeddings"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "torch>=2.4",
+    "rtdl-num-embeddings==0.0.12",
+]
+
+[project.optional-dependencies]
+test = [
+    "pytest>=8",
+    "numpy",
+]
+
+[tool.pytest.ini_options]
+addopts = "-ra"
+testpaths = ["tests"]
+markers = [
+    "cuda: requires a CUDA-capable GPU",
+    "performance: performance benchmark",
+]

@@ -20,8 +20,8 @@ from torch import Tensor, nn
 
 from rtdl_num_embeddings import PiecewiseLinearEmbeddings
 
-from src.PiecewiseLinearEmbeddings import (
-    OptimizedPiecewiseLinearEmbeddings,
+from rtdl_num_embeddings_cuda import (
+    CudaPiecewiseLinearEmbeddings,
 )
 from tests.utils import sample_features
 
@@ -401,7 +401,7 @@ def build_equivalent_modules(
     seed: int,
 ) -> tuple[
     PiecewiseLinearEmbeddings,
-    OptimizedPiecewiseLinearEmbeddings,
+    CudaPiecewiseLinearEmbeddings,
 ]:
     """
     Build functionally equivalent original and optimized modules.
@@ -427,7 +427,7 @@ def build_equivalent_modules(
         dtype=torch.float32,
     )
 
-    optimized = OptimizedPiecewiseLinearEmbeddings(
+    optimized = CudaPiecewiseLinearEmbeddings(
         bins=bins,
         d_embedding=d_embedding,
         activation=activation,

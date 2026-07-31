@@ -9,7 +9,9 @@ import torch
 from torch import Tensor
 
 from rtdl_num_embeddings import PiecewiseLinearEmbeddings
-from src.PiecewiseLinearEmbeddings import OptimizedPiecewiseLinearEmbeddings
+from rtdl_num_embeddings_cuda import (
+    CudaPiecewiseLinearEmbeddings,
+)
 from tests.utils import BIN_CASE_NAMES, make_bins, sample_features
 
 
@@ -73,7 +75,7 @@ def build_equivalent_modules(
     seed: int,
 ) -> tuple[
     PiecewiseLinearEmbeddings,
-    OptimizedPiecewiseLinearEmbeddings,
+    CudaPiecewiseLinearEmbeddings,
 ]:
     """
     Build the original and optimized modules and copy trainable parameters
@@ -89,7 +91,7 @@ def build_equivalent_modules(
         dtype=torch.float32,
     )
 
-    optimized = OptimizedPiecewiseLinearEmbeddings(
+    optimized = CudaPiecewiseLinearEmbeddings(
         bins=bins,
         d_embedding=d_embedding,
         activation=activation,
