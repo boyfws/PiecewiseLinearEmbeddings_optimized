@@ -21,10 +21,21 @@ FORWARD_ATOL = 2e-6
 GRAD_RTOL = 9e-5
 GRAD_ATOL = 9e-6
 
+AMP_FORWARD_RTOL = 8e-3
+AMP_FORWARD_ATOL = 8e-3
+
+AMP_GRAD_RTOL = 2e-2
+AMP_GRAD_ATOL = 2e-2
+
 TEST_DEVICES = (
     ["cpu", "cuda"]
     if torch.cuda.is_available()
     else ["cpu"]
+)
+
+CUDA_BFLOAT16_AVAILABLE = (
+    torch.cuda.is_available()
+    and torch.cuda.is_bf16_supported()
 )
 
 D_EMBEDDING_VALUES = (10, 15, 20)
@@ -213,6 +224,96 @@ def test_forward_matches_original(
 
 
 # ============================================================
+# AMP BF16 forward tests
+# ============================================================
+
+
+@pytest.mark.skipif(
+    not CUDA_BFLOAT16_AVAILABLE,
+    reason="CUDA BF16 is not available",
+)
+@pytest.mark.parametrize(
+    "case_name",
+    BIN_CASE_NAMES,
+)
+@pytest.mark.parametrize(
+    "version",
+    ("A", "B"),
+)
+@pytest.mark.parametrize(
+    "activation",
+    (False, True),
+)
+@pytest.mark.parametrize(
+    "seed",
+    SEED_VALUES,
+)
+@pytest.mark.parametrize(
+    "d_embedding",
+    D_EMBEDDING_VALUES,
+)
+def test_forward_amp_bfloat16_matches_original(
+    case_name: str,
+    version: Literal["A", "B"],
+    activation: bool,
+    seed: int,
+    d_embedding: int,
+) -> None:
+    bins = make_bins(case_name)
+
+    original, optimized = build_equivalent_modules(
+        bins=bins,
+        d_embedding=d_embedding,
+        activation=activation,
+        version=version,
+        device="cuda",
+        seed=seed,
+    )
+
+    x = sample_features(
+        bins,
+        batch_size=128,
+        seed=seed + 4000,
+    ).to(
+        device="cuda",
+        dtype=torch.float32,
+    )
+
+    with torch.no_grad():
+        with torch.autocast(
+            device_type="cuda",
+            dtype=torch.bfloat16,
+        ):
+            expected = original(x)
+            actual = optimized(x)
+
+    expected_shape = (
+        x.shape[0],
+        len(bins),
+        d_embedding,
+    )
+
+    assert tuple(expected.shape) == expected_shape
+    assert tuple(actual.shape) == expected_shape
+
+    assert expected.dtype == torch.bfloat16
+    assert actual.dtype == torch.bfloat16
+    assert actual.device == expected.device
+
+    assert (
+        optimized.get_output_shape()
+        == original.get_output_shape()
+    )
+
+    torch.testing.assert_close(
+        actual.float(),
+        expected.float(),
+        rtol=AMP_FORWARD_RTOL,
+        atol=AMP_FORWARD_ATOL,
+    )
+
+
+# ============================================================
 # Backward tests
 # ============================================================
 
@@ -388,4 +489,213 @@ def test_backward_matches_original(
             rtol=GRAD_RTOL,
             atol=GRAD_ATOL,
         )
-        
+
+
+# ============================================================
+# AMP BF16 backward tests
+# ============================================================
+
+
+@pytest.mark.skipif(
+    not CUDA_BFLOAT16_AVAILABLE,
+    reason="CUDA BF16 is not available",
+)
+@pytest.mark.parametrize(
+    "case_name",
+    BIN_CASE_NAMES,
+)
+@pytest.mark.parametrize(
+    "version",
+    ("A", "B"),
+)
+@pytest.mark.parametrize(
+    "activation",
+    (False, True),
+)
+@pytest.mark.parametrize(
+    "seed",
+    SEED_VALUES,
+)
+@pytest.mark.parametrize(
+    "d_embedding",
+    D_EMBEDDING_VALUES,
+)
+def test_backward_amp_bfloat16_matches_original(
+    case_name: str,
+    version: Literal["A", "B"],
+    activation: bool,
+    seed: int,
+    d_embedding: int,
+) -> None:
+    bins = make_bins(case_name)
+
+    original, optimized = build_equivalent_modules(
+        bins=bins,
+        d_embedding=d_embedding,
+        activation=activation,
+        version=version,
+        device="cuda",
+        seed=seed,
+    )
+
+    x_base = sample_features(
+        bins,
+        batch_size=128,
+        seed=seed + 5000,
+    ).to(
+        device="cuda",
+        dtype=torch.float32,
+    )
+
+    x_original = (
+        x_base.detach()
+        .clone()
+        .requires_grad_(True)
+    )
+
+    x_optimized = (
+        x_base.detach()
+        .clone()
+        .requires_grad_(True)
+    )
+
+    original.zero_grad(
+        set_to_none=True,
+    )
+
+    optimized.zero_grad(
+        set_to_none=True,
+    )
+
+    with torch.autocast(
+        device_type="cuda",
+        dtype=torch.bfloat16,
+    ):
+        output_original = original(
+            x_original
+        )
+
+        output_optimized = optimized(
+            x_optimized
+        )
+
+    assert output_original.dtype == torch.bfloat16
+    assert output_optimized.dtype == torch.bfloat16
+
+    torch.testing.assert_close(
+        output_optimized.float(),
+        output_original.float(),
+        rtol=AMP_FORWARD_RTOL,
+        atol=AMP_FORWARD_ATOL,
+    )
+
+    torch.manual_seed(seed + 6000)
+    torch.cuda.manual_seed_all(seed + 6000)
+
+    grad_output = torch.randn(
+        output_original.shape,
+        device="cuda",
+        dtype=torch.float32,
+    ).to(
+        dtype=output_original.dtype,
+    )
+
+    torch.autograd.backward(
+        output_original,
+        grad_output,
+    )
+
+    torch.autograd.backward(
+        output_optimized,
+        grad_output,
+    )
+
+    # --------------------------------------------------------
+    # Input gradients
+    # --------------------------------------------------------
+
+    assert x_original.grad is not None
+    assert x_optimized.grad is not None
+
+    assert x_original.grad.dtype == torch.float32
+    assert x_optimized.grad.dtype == torch.float32
+
+    torch.testing.assert_close(
+        x_optimized.grad,
+        x_original.grad,
+        rtol=AMP_GRAD_RTOL,
+        atol=AMP_GRAD_ATOL,
+    )
+
+    # --------------------------------------------------------
+    # PLE parameter gradients
+    # --------------------------------------------------------
+
+    assert original.linear.weight.grad is not None
+    assert optimized.linear.weight.grad is not None
+
+    assert original.linear.weight.grad.dtype == torch.float32
+    assert optimized.linear.weight.grad.dtype == torch.float32
+
+    torch.testing.assert_close(
+        optimized.linear.weight.grad,
+        original.linear.weight.grad,
+        rtol=AMP_GRAD_RTOL,
+        atol=AMP_GRAD_ATOL,
+    )
+
+    # --------------------------------------------------------
+    # Version-specific parameter gradients
+    # --------------------------------------------------------
+
+    if version == "A":
+        assert original.linear.bias is not None
+        assert optimized.linear.bias is not None
+
+        assert original.linear.bias.grad is not None
+        assert optimized.linear.bias.grad is not None
+
+        assert original.linear.bias.grad.dtype == torch.float32
+        assert optimized.linear.bias.grad.dtype == torch.float32
+
+        torch.testing.assert_close(
+            optimized.linear.bias.grad,
+            original.linear.bias.grad,
+            rtol=AMP_GRAD_RTOL,
+            atol=AMP_GRAD_ATOL,
+        )
+
+        assert original.linear0 is None
+        assert optimized.linear0 is None
+
+    else:
+        assert original.linear.bias is None
+        assert optimized.linear.bias is None
+
+        assert original.linear0 is not None
+        assert optimized.linear0 is not None
+
+        assert original.linear0.weight.grad is not None
+        assert optimized.linear0.weight.grad is not None
+
+        assert original.linear0.bias.grad is not None
+        assert optimized.linear0.bias.grad is not None
+
+        assert original.linear0.weight.grad.dtype == torch.float32
+        assert optimized.linear0.weight.grad.dtype == torch.float32
+        assert original.linear0.bias.grad.dtype == torch.float32
+        assert optimized.linear0.bias.grad.dtype == torch.float32
+
+        torch.testing.assert_close(
+            optimized.linear0.weight.grad,
+            original.linear0.weight.grad,
+            rtol=AMP_GRAD_RTOL,
+            atol=AMP_GRAD_ATOL,
+        )
+
+        torch.testing.assert_close(
+            optimized.linear0.bias.grad,
+            original.linear0.bias.grad,
+            rtol=AMP_GRAD_RTOL,
+            atol=AMP_GRAD_ATOL,
+        )
