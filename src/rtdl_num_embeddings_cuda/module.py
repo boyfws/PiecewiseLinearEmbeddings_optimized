@@ -44,6 +44,10 @@ class CudaPiecewiseLinearEmbeddings(
         activation: bool,
         version: Literal[None, "A", "B"] = None,
     ) -> None:
+        assert d_embedding <= 64, (
+            "d_embedding must be less than or equal to 64"
+        )
+
         super().__init__(
             bins,
             d_embedding,
