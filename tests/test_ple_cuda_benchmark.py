@@ -231,9 +231,9 @@ class BenchmarkCase:
 
 
 batch_size = [2_048, 8_192, 20_000]
-n_features = [32, 64, 256]
-n_bins = [16, 48, 64]
-d_embedding = [12, 16, 32]
+n_features = [32, 64, 256] # Might be unlimited
+n_bins = [32, 48, 64, 96] # n_bins >= 32
+d_embedding = [12, 16, 32, 64] # We consider d_embedding <= 64 for most tasks
 
 
 BENCHMARK_CASES = tuple(
