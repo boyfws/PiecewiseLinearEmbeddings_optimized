@@ -11,16 +11,25 @@ _SUPPORTED_OUTPUT_DTYPES = (
 )
 
 
+def _bin_indices_dtype(max_n_bins: int) -> torch.dtype:
+    if max_n_bins <= 256:
+        return torch.uint8
+    if max_n_bins <= 32768:
+        return torch.int16
+    return torch.int32
+
+
 @torch.library.register_fake(
     "rtdl_num_embeddings_cuda::forward"
 )
 def _forward_fake(
     x: Tensor,
     bin_edges: Tensor,
+    inv_bin_widths: Tensor,
     n_bins: Tensor,
     weight: Tensor,
     output_dtype: torch.dtype,
-) -> Tensor:
+) -> tuple[Tensor, Tensor]:
     torch._check(
         x.ndim == 2,
         lambda: "x must have shape [N, F]",
@@ -28,6 +37,10 @@ def _forward_fake(
     torch._check(
         bin_edges.ndim == 2,
         lambda: "bin_edges must have shape [F, B + 1]",
+    )
+    torch._check(
+        inv_bin_widths.ndim == 2,
+        lambda: "inv_bin_widths must have shape [F, B]",
     )
     torch._check(
         n_bins.ndim == 1,
@@ -50,6 +63,14 @@ def _forward_fake(
         lambda: "bin_edges.shape[1] must equal weight.shape[1] + 1",
     )
     torch._check(
+        inv_bin_widths.shape[0] == weight.shape[0],
+        lambda: "inv_bin_widths.shape[0] must equal weight.shape[0]",
+    )
+    torch._check(
+        inv_bin_widths.shape[1] == weight.shape[1],
+        lambda: "inv_bin_widths.shape[1] must equal weight.shape[1]",
+    )
+    torch._check(
         n_bins.shape[0] == weight.shape[0],
         lambda: "n_bins.shape[0] must equal weight.shape[0]",
     )
@@ -60,6 +81,10 @@ def _forward_fake(
     torch._check(
         bin_edges.dtype == torch.float32,
         lambda: "bin_edges must be float32",
+    )
+    torch._check(
+        inv_bin_widths.dtype == torch.float32,
+        lambda: "inv_bin_widths must be float32",
     )
     torch._check(
         n_bins.dtype == torch.int32,
@@ -74,14 +99,24 @@ def _forward_fake(
         lambda: "Unsupported output dtype",
     )
 
-    return torch.empty(
-        (
-            x.shape[0],
-            x.shape[1],
-            weight.shape[2],
+    return (
+        torch.empty(
+            (
+                x.shape[0],
+                x.shape[1],
+                weight.shape[2],
+            ),
+            dtype=output_dtype,
+            device=x.device,
         ),
-        dtype=output_dtype,
-        device=x.device,
+        torch.empty(
+            (
+                x.shape[0],
+                x.shape[1],
+            ),
+            dtype=_bin_indices_dtype(weight.shape[1]),
+            device=x.device,
+        ),
     )
 
 
@@ -92,8 +127,10 @@ def _backward_fake(
     grad_output: Tensor,
     x: Tensor,
     bin_edges: Tensor,
+    inv_bin_widths: Tensor,
     n_bins: Tensor,
     weight: Tensor,
+    bin_indices: Tensor,
     compute_grad_x: bool,
     compute_grad_weight: bool,
 ) -> tuple[Tensor, Tensor]:
@@ -112,6 +149,18 @@ def _backward_fake(
     torch._check(
         grad_output.shape[2] == weight.shape[2],
         lambda: "grad_output D mismatch",
+    )
+    torch._check(
+        bin_indices.shape[0] == x.shape[0],
+        lambda: "bin_indices N mismatch",
+    )
+    torch._check(
+        bin_indices.shape[1] == x.shape[1],
+        lambda: "bin_indices F mismatch",
+    )
+    torch._check(
+        bin_indices.dtype == _bin_indices_dtype(weight.shape[1]),
+        lambda: "bin_indices has an invalid dtype",
     )
     torch._check(
         grad_output.dtype in _SUPPORTED_OUTPUT_DTYPES,

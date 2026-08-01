@@ -76,6 +76,14 @@ class CudaPiecewiseLinearEmbeddings(
             dtype=torch.float32,
             device=base_device,
         )
+        padded_inv_bin_widths = torch.zeros(
+            (
+                n_features,
+                max_n_bins,
+            ),
+            dtype=torch.float32,
+            device=base_device,
+        )
 
         for feature_idx, edges in enumerate(bins):
             edges_float32 = edges.to(
@@ -86,12 +94,26 @@ class CudaPiecewiseLinearEmbeddings(
                 feature_idx,
                 : edges_float32.numel(),
             ].copy_(edges_float32)
+            padded_inv_bin_widths[
+                feature_idx,
+                : edges_float32.numel() - 1,
+            ].copy_(
+                torch.reciprocal(
+                    edges_float32[1:]
+                    - edges_float32[:-1]
+                )
+            )
 
         # Non-persistent buffers preserve strict state_dict compatibility with
         # the original PiecewiseLinearEmbeddings.
         self.register_buffer(
             "_cuda_bin_edges",
             padded_edges,
+            persistent=False,
+        )
+        self.register_buffer(
+            "_cuda_inv_bin_widths",
+            padded_inv_bin_widths,
             persistent=False,
         )
         self.register_buffer(
@@ -153,6 +175,10 @@ class CudaPiecewiseLinearEmbeddings(
             raise RuntimeError(
                 "_cuda_bin_edges must be contiguous"
             )
+        if not self._cuda_inv_bin_widths.is_contiguous():
+            raise RuntimeError(
+                "_cuda_inv_bin_widths must be contiguous"
+            )
         if not self._cuda_n_bins.is_contiguous():
             raise RuntimeError(
                 "_cuda_n_bins must be contiguous"
@@ -162,13 +188,17 @@ class CudaPiecewiseLinearEmbeddings(
                 "linear.weight must be contiguous"
             )
 
-        return torch.ops.rtdl_num_embeddings_cuda.forward(
-            x,
-            self._cuda_bin_edges,
-            self._cuda_n_bins,
-            self.linear.weight,
-            self._cuda_output_dtype(),
+        x_ple, _bin_indices = (
+            torch.ops.rtdl_num_embeddings_cuda.forward(
+                x,
+                self._cuda_bin_edges,
+                self._cuda_inv_bin_widths,
+                self._cuda_n_bins,
+                self.linear.weight,
+                self._cuda_output_dtype(),
+            )
         )
+        return x_ple
 
     def forward(
         self,

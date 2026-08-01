@@ -14,6 +14,8 @@
 
 namespace rtdl_num_embeddings_cuda {
 
+constexpr int kTargetPersistentBlocks = 256;
+
 
 template <int kTileD>
 __device__ __forceinline__ float group_reduce_sum(
@@ -35,13 +37,15 @@ __device__ __forceinline__ float group_reduce_sum(
 }
 
 
-template <typename grad_t, int kTileD>
+template <typename grad_t, typename bin_index_t, int kTileD>
 __global__ void ple_backward_shared_kernel(
     const grad_t* __restrict__ grad_output,
     const float* __restrict__ x,
     const float* __restrict__ bin_edges,
+    const float* __restrict__ inv_bin_widths,
     const int32_t* __restrict__ n_bins,
     const float* __restrict__ weight,
+    const bin_index_t* __restrict__ bin_indices,
     float* __restrict__ grad_x,
     float* __restrict__ bucket_sum,
     float* __restrict__ weighted_sum,
@@ -51,15 +55,19 @@ __global__ void ple_backward_shared_kernel(
     int64_t d_embedding,
     int64_t n_batch_tiles,
     int64_t n_d_tiles,
-    int64_t total_tiles,
+    int64_t n_partitions,
+    int64_t total_persistent_tiles,
     bool compute_grad_x,
     bool compute_grad_weight
 ) {
     extern __shared__ float shared_memory[];
 
     float* shared_edges = shared_memory;
-    float* shared_bucket = (
+    float* shared_inv_bin_widths = (
         shared_edges + max_n_bins + 1
+    );
+    float* shared_bucket = (
+        shared_inv_bin_widths + max_n_bins
     );
     float* shared_weighted = (
         shared_bucket
@@ -75,20 +83,24 @@ __global__ void ple_backward_shared_kernel(
     );
 
     for (
-        int64_t tile_index = blockIdx.x;
-        tile_index < total_tiles;
-        tile_index += gridDim.x
+        int64_t persistent_tile = blockIdx.x;
+        persistent_tile < total_persistent_tiles;
+        persistent_tile += gridDim.x
     ) {
-        int64_t remainder = tile_index;
-
+        int64_t remainder = persistent_tile;
+        const int64_t partition_idx = (
+            remainder % n_partitions
+        );
+        remainder /= n_partitions;
         const int64_t d_tile = remainder % n_d_tiles;
-        remainder /= n_d_tiles;
-        const int64_t batch_tile = remainder % n_batch_tiles;
-        const int64_t feature_idx = remainder / n_batch_tiles;
+        const int64_t feature_idx = remainder / n_d_tiles;
 
         const int n_real_bins = n_bins[feature_idx];
         const int64_t edge_row_offset = (
             feature_idx * (max_n_bins + 1)
+        );
+        const int64_t width_row_offset = (
+            feature_idx * max_n_bins
         );
 
         for (
@@ -98,6 +110,17 @@ __global__ void ple_backward_shared_kernel(
         ) {
             shared_edges[edge_idx] = (
                 bin_edges[edge_row_offset + edge_idx]
+            );
+        }
+        for (
+            int logical_bin = threadIdx.x;
+            logical_bin < n_real_bins;
+            logical_bin += blockDim.x
+        ) {
+            shared_inv_bin_widths[logical_bin] = (
+                inv_bin_widths[
+                    width_row_offset + logical_bin
+                ]
             );
         }
 
@@ -122,199 +145,213 @@ __global__ void ple_backward_shared_kernel(
         const int64_t d_global = (
             d_tile * kTileD + lane_idx
         );
-        const int64_t batch_base = (
-            batch_tile * kSamplesPerBlock
-        );
 
         for (
-            int sample_offset = group_idx;
-            sample_offset < kSamplesPerBlock;
-            sample_offset += kGroupsPerBlock
+            int64_t batch_tile = partition_idx;
+            batch_tile < n_batch_tiles;
+            batch_tile += n_partitions
         ) {
-            const int64_t sample_idx = (
-                batch_base + sample_offset
+            const int64_t batch_base = (
+                batch_tile * kSamplesPerBlock
             );
 
-            int logical_bin = 0;
-            int is_internal_boundary = 0;
-            float position = 0.0f;
-            float current_width = 1.0f;
-            float previous_width = 1.0f;
-
-            if (
-                lane_idx == 0
-                && sample_idx < batch_size
+            for (
+                int sample_offset = group_idx;
+                sample_offset < kSamplesPerBlock;
+                sample_offset += kGroupsPerBlock
             ) {
-                const float value = x[
-                    sample_idx * n_features + feature_idx
-                ];
-
-                logical_bin = find_logical_bin_right(
-                    value,
-                    shared_edges,
-                    n_real_bins
+                const int64_t sample_idx = (
+                    batch_base + sample_offset
                 );
 
-                const float left_edge = shared_edges[logical_bin];
-                const float right_edge = shared_edges[logical_bin + 1];
-                current_width = right_edge - left_edge;
-                position = (value - left_edge) / current_width;
-
-                // At an exact internal edge, the original clamp-based PLE
-                // has a derivative contribution from both adjacent channels.
-                is_internal_boundary = (
-                    logical_bin > 0
-                    && value == left_edge
-                );
-                if (is_internal_boundary) {
-                    previous_width = (
-                        shared_edges[logical_bin]
-                        - shared_edges[logical_bin - 1]
-                    );
-                }
-            }
-
-            logical_bin = __shfl_sync(
-                0xffffffffu,
-                logical_bin,
-                0,
-                kTileD
-            );
-            is_internal_boundary = __shfl_sync(
-                0xffffffffu,
-                is_internal_boundary,
-                0,
-                kTileD
-            );
-            position = __shfl_sync(
-                0xffffffffu,
-                position,
-                0,
-                kTileD
-            );
-            current_width = __shfl_sync(
-                0xffffffffu,
-                current_width,
-                0,
-                kTileD
-            );
-            previous_width = __shfl_sync(
-                0xffffffffu,
-                previous_width,
-                0,
-                kTileD
-            );
-
-            float grad_x_partial = 0.0f;
-
-            if (
-                sample_idx < batch_size
-                && d_global < d_embedding
-            ) {
-                const int64_t output_index = (
-                    (
-                        sample_idx * n_features
-                        + feature_idx
-                    )
-                    * d_embedding
-                    + d_global
-                );
-                const float grad_value = load_as_float<grad_t>(
-                    grad_output + output_index
-                );
-
-                const float quantized_position = (
-                    quantize_to_float<grad_t>(position)
-                );
-
-                if (compute_grad_weight) {
-                    atomicAdd(
-                        shared_bucket
-                        + logical_bin * kTileD
-                        + lane_idx,
-                        grad_value
-                    );
-                    atomicAdd(
-                        shared_weighted
-                        + logical_bin * kTileD
-                        + lane_idx,
-                        quantized_position * grad_value
-                    );
-                }
-
-                if (compute_grad_x) {
-                    const int current_physical_bin = physical_bin_index(
-                        logical_bin,
-                        n_real_bins,
-                        static_cast<int>(max_n_bins)
-                    );
-                    const int64_t current_weight_index = (
-                        (
-                            feature_idx * max_n_bins
-                            + current_physical_bin
-                        )
-                        * d_embedding
-                        + d_global
-                    );
-                    const float current_weight = (
-                        quantize_to_float<grad_t>(
-                            weight[current_weight_index]
-                        )
-                    );
-
-                    grad_x_partial = (
-                        grad_value
-                        * current_weight
-                        / current_width
-                    );
-
-                    if (is_internal_boundary) {
-                        const int previous_physical_bin = (
-                            logical_bin - 1
-                        );
-                        const int64_t previous_weight_index = (
-                            (
-                                feature_idx * max_n_bins
-                                + previous_physical_bin
-                            )
-                            * d_embedding
-                            + d_global
-                        );
-                        const float previous_weight = (
-                            quantize_to_float<grad_t>(
-                                weight[previous_weight_index]
-                            )
-                        );
-                        grad_x_partial += (
-                            grad_value
-                            * previous_weight
-                            / previous_width
-                        );
-                    }
-                }
-            }
-
-            if (compute_grad_x) {
-                grad_x_partial = group_reduce_sum<kTileD>(
-                    grad_x_partial
-                );
+                int logical_bin = 0;
+                int is_internal_boundary = 0;
+                float position = 0.0f;
+                float current_inv_width = 1.0f;
+                float previous_inv_width = 1.0f;
 
                 if (
                     lane_idx == 0
                     && sample_idx < batch_size
                 ) {
-                    atomicAdd(
-                        grad_x
-                        + sample_idx * n_features
-                        + feature_idx,
+                    const int64_t pair_idx = (
+                        sample_idx * n_features
+                        + feature_idx
+                    );
+                    const float value = x[pair_idx];
+                    logical_bin = static_cast<int>(
+                        bin_indices[pair_idx]
+                    );
+                    const float left_edge = (
+                        shared_edges[logical_bin]
+                    );
+                    current_inv_width = (
+                        shared_inv_bin_widths[logical_bin]
+                    );
+                    position = (
+                        value - left_edge
+                    ) * current_inv_width;
+
+                    // At an exact internal edge, the original clamp-based PLE
+                    // has a derivative contribution from both adjacent
+                    // channels.
+                    is_internal_boundary = (
+                        logical_bin > 0
+                        && value == left_edge
+                    );
+                    if (is_internal_boundary) {
+                        previous_inv_width = (
+                            shared_inv_bin_widths[
+                                logical_bin - 1
+                            ]
+                        );
+                    }
+                }
+
+                logical_bin = __shfl_sync(
+                    0xffffffffu,
+                    logical_bin,
+                    0,
+                    kTileD
+                );
+                is_internal_boundary = __shfl_sync(
+                    0xffffffffu,
+                    is_internal_boundary,
+                    0,
+                    kTileD
+                );
+                position = __shfl_sync(
+                    0xffffffffu,
+                    position,
+                    0,
+                    kTileD
+                );
+                current_inv_width = __shfl_sync(
+                    0xffffffffu,
+                    current_inv_width,
+                    0,
+                    kTileD
+                );
+                previous_inv_width = __shfl_sync(
+                    0xffffffffu,
+                    previous_inv_width,
+                    0,
+                    kTileD
+                );
+
+                float grad_x_partial = 0.0f;
+
+                if (
+                    sample_idx < batch_size
+                    && d_global < d_embedding
+                ) {
+                    const int64_t output_index = (
+                        (
+                            sample_idx * n_features
+                            + feature_idx
+                        )
+                        * d_embedding
+                        + d_global
+                    );
+                    const float grad_value = load_as_float<grad_t>(
+                        grad_output + output_index
+                    );
+                    const float quantized_position = (
+                        quantize_to_float<grad_t>(position)
+                    );
+
+                    if (compute_grad_weight) {
+                        atomicAdd(
+                            shared_bucket
+                            + logical_bin * kTileD
+                            + lane_idx,
+                            grad_value
+                        );
+                        atomicAdd(
+                            shared_weighted
+                            + logical_bin * kTileD
+                            + lane_idx,
+                            quantized_position * grad_value
+                        );
+                    }
+
+                    if (compute_grad_x) {
+                        const int current_physical_bin = (
+                            physical_bin_index(
+                                logical_bin,
+                                n_real_bins,
+                                static_cast<int>(max_n_bins)
+                            )
+                        );
+                        const int64_t current_weight_index = (
+                            (
+                                feature_idx * max_n_bins
+                                + current_physical_bin
+                            )
+                            * d_embedding
+                            + d_global
+                        );
+                        const float current_weight = (
+                            quantize_to_float<grad_t>(
+                                weight[current_weight_index]
+                            )
+                        );
+
+                        grad_x_partial = (
+                            grad_value
+                            * current_weight
+                            * current_inv_width
+                        );
+
+                        if (is_internal_boundary) {
+                            const int previous_physical_bin = (
+                                logical_bin - 1
+                            );
+                            const int64_t previous_weight_index = (
+                                (
+                                    feature_idx * max_n_bins
+                                    + previous_physical_bin
+                                )
+                                * d_embedding
+                                + d_global
+                            );
+                            const float previous_weight = (
+                                quantize_to_float<grad_t>(
+                                    weight[previous_weight_index]
+                                )
+                            );
+                            grad_x_partial += (
+                                grad_value
+                                * previous_weight
+                                * previous_inv_width
+                            );
+                        }
+                    }
+                }
+
+                if (compute_grad_x) {
+                    grad_x_partial = group_reduce_sum<kTileD>(
                         grad_x_partial
                     );
+
+                    if (
+                        lane_idx == 0
+                        && sample_idx < batch_size
+                    ) {
+                        atomicAdd(
+                            grad_x
+                            + sample_idx * n_features
+                            + feature_idx,
+                            grad_x_partial
+                        );
+                    }
                 }
             }
         }
 
         __syncthreads();
 
+        // One global flush per persistent batch partition.
         if (compute_grad_weight) {
             const int shared_elements = (
                 n_real_bins * kTileD
@@ -357,13 +394,15 @@ __global__ void ple_backward_shared_kernel(
 }
 
 
-template <typename grad_t>
+template <typename grad_t, typename bin_index_t>
 __global__ void ple_backward_generic_kernel(
     const grad_t* __restrict__ grad_output,
     const float* __restrict__ x,
     const float* __restrict__ bin_edges,
+    const float* __restrict__ inv_bin_widths,
     const int32_t* __restrict__ n_bins,
     const float* __restrict__ weight,
+    const bin_index_t* __restrict__ bin_indices,
     float* __restrict__ grad_x,
     float* __restrict__ bucket_sum,
     float* __restrict__ weighted_sum,
@@ -394,40 +433,41 @@ __global__ void ple_backward_generic_kernel(
         )
     ) {
         const int64_t feature_idx = pair_idx % n_features;
-        const int64_t sample_idx = pair_idx / n_features;
         const int n_real_bins = n_bins[feature_idx];
         const float* feature_edges = (
             bin_edges
             + feature_idx * (max_n_bins + 1)
         );
+        const float* feature_inv_bin_widths = (
+            inv_bin_widths
+            + feature_idx * max_n_bins
+        );
 
         int logical_bin = 0;
         int is_internal_boundary = 0;
         float position = 0.0f;
-        float current_width = 1.0f;
-        float previous_width = 1.0f;
+        float current_inv_width = 1.0f;
+        float previous_inv_width = 1.0f;
 
         if (lane_idx == 0) {
             const float value = x[pair_idx];
-            logical_bin = find_logical_bin_right(
-                value,
-                feature_edges,
-                n_real_bins
+            logical_bin = static_cast<int>(
+                bin_indices[pair_idx]
             );
             const float left_edge = feature_edges[logical_bin];
-            current_width = (
-                feature_edges[logical_bin + 1]
-                - left_edge
+            current_inv_width = (
+                feature_inv_bin_widths[logical_bin]
             );
-            position = (value - left_edge) / current_width;
+            position = (
+                value - left_edge
+            ) * current_inv_width;
             is_internal_boundary = (
                 logical_bin > 0
                 && value == left_edge
             );
             if (is_internal_boundary) {
-                previous_width = (
-                    feature_edges[logical_bin]
-                    - feature_edges[logical_bin - 1]
+                previous_inv_width = (
+                    feature_inv_bin_widths[logical_bin - 1]
                 );
             }
         }
@@ -447,14 +487,14 @@ __global__ void ple_backward_generic_kernel(
             position,
             0
         );
-        current_width = __shfl_sync(
+        current_inv_width = __shfl_sync(
             0xffffffffu,
-            current_width,
+            current_inv_width,
             0
         );
-        previous_width = __shfl_sync(
+        previous_inv_width = __shfl_sync(
             0xffffffffu,
-            previous_width,
+            previous_inv_width,
             0
         );
 
@@ -516,7 +556,7 @@ __global__ void ple_backward_generic_kernel(
                 grad_x_partial += (
                     grad_value
                     * current_weight
-                    / current_width
+                    * current_inv_width
                 );
 
                 if (is_internal_boundary) {
@@ -536,7 +576,7 @@ __global__ void ple_backward_generic_kernel(
                     grad_x_partial += (
                         grad_value
                         * previous_weight
-                        / previous_width
+                        * previous_inv_width
                     );
                 }
             }
@@ -623,13 +663,15 @@ __global__ void finalize_grad_weight_kernel(
 }
 
 
-template <typename grad_t>
+template <typename grad_t, typename bin_index_t>
 void launch_ple_backward(
     const at::Tensor& grad_output,
     const at::Tensor& x,
     const at::Tensor& bin_edges,
+    const at::Tensor& inv_bin_widths,
     const at::Tensor& n_bins,
     const at::Tensor& weight,
+    const at::Tensor& bin_indices,
     at::Tensor& grad_x,
     at::Tensor& grad_weight,
     bool compute_grad_x,
@@ -666,22 +708,32 @@ void launch_ple_backward(
         TORCH_CHECK(
             n_features <= (
                 std::numeric_limits<int64_t>::max()
-                / n_batch_tiles
+                / n_d_tiles
             ),
-            "The backward launch tile count overflows int64"
+            "The backward persistent tile count overflows int64"
         );
-        const int64_t feature_batch_tiles = (
-            n_features * n_batch_tiles
+        const int64_t feature_d_tiles = (
+            n_features * n_d_tiles
+        );
+        const int64_t n_partitions = std::min<int64_t>(
+            n_batch_tiles,
+            std::max<int64_t>(
+                1,
+                ceil_div<int64_t>(
+                    kTargetPersistentBlocks,
+                    feature_d_tiles
+                )
+            )
         );
         TORCH_CHECK(
-            n_d_tiles <= (
+            feature_d_tiles <= (
                 std::numeric_limits<int64_t>::max()
-                / feature_batch_tiles
+                / n_partitions
             ),
-            "The backward launch tile count overflows int64"
+            "The backward persistent tile count overflows int64"
         );
-        const int64_t total_tiles = (
-            feature_batch_tiles * n_d_tiles
+        const int64_t total_persistent_tiles = (
+            feature_d_tiles * n_partitions
         );
 
         const size_t accumulator_bytes = (
@@ -693,7 +745,7 @@ void launch_ple_backward(
                 : 0
         );
         const size_t shared_bytes = (
-            static_cast<size_t>(max_n_bins + 1)
+            static_cast<size_t>(2 * max_n_bins + 1)
             * sizeof(float)
             + accumulator_bytes
         );
@@ -712,7 +764,7 @@ void launch_ple_backward(
         );
         const int launch_blocks = static_cast<int>(
             std::min<int64_t>(
-                total_tiles,
+                total_persistent_tiles,
                 kMaxLaunchBlocks
             )
         );
@@ -745,12 +797,20 @@ void launch_ple_backward(
             if (tile_d == 16) {
                 C10_CUDA_CHECK(
                     cudaFuncSetAttribute(
-                        ple_backward_shared_kernel<grad_t, 16>,
+                        ple_backward_shared_kernel<
+                            grad_t,
+                            bin_index_t,
+                            16
+                        >,
                         cudaFuncAttributeMaxDynamicSharedMemorySize,
                         static_cast<int>(shared_bytes)
                     )
                 );
-                ple_backward_shared_kernel<grad_t, 16><<<
+                ple_backward_shared_kernel<
+                    grad_t,
+                    bin_index_t,
+                    16
+                ><<<
                     launch_blocks,
                     kBlockThreads,
                     shared_bytes,
@@ -759,8 +819,10 @@ void launch_ple_backward(
                     grad_output.data_ptr<grad_t>(),
                     x.data_ptr<float>(),
                     bin_edges.data_ptr<float>(),
+                    inv_bin_widths.data_ptr<float>(),
                     n_bins.data_ptr<int32_t>(),
                     weight.data_ptr<float>(),
+                    bin_indices.data_ptr<bin_index_t>(),
                     grad_x_pointer,
                     bucket_pointer,
                     weighted_pointer,
@@ -770,19 +832,28 @@ void launch_ple_backward(
                     d_embedding,
                     n_batch_tiles,
                     n_d_tiles,
-                    total_tiles,
+                    n_partitions,
+                    total_persistent_tiles,
                     compute_grad_x,
                     compute_grad_weight
                 );
             } else {
                 C10_CUDA_CHECK(
                     cudaFuncSetAttribute(
-                        ple_backward_shared_kernel<grad_t, 32>,
+                        ple_backward_shared_kernel<
+                            grad_t,
+                            bin_index_t,
+                            32
+                        >,
                         cudaFuncAttributeMaxDynamicSharedMemorySize,
                         static_cast<int>(shared_bytes)
                     )
                 );
-                ple_backward_shared_kernel<grad_t, 32><<<
+                ple_backward_shared_kernel<
+                    grad_t,
+                    bin_index_t,
+                    32
+                ><<<
                     launch_blocks,
                     kBlockThreads,
                     shared_bytes,
@@ -791,8 +862,10 @@ void launch_ple_backward(
                     grad_output.data_ptr<grad_t>(),
                     x.data_ptr<float>(),
                     bin_edges.data_ptr<float>(),
+                    inv_bin_widths.data_ptr<float>(),
                     n_bins.data_ptr<int32_t>(),
                     weight.data_ptr<float>(),
+                    bin_indices.data_ptr<bin_index_t>(),
                     grad_x_pointer,
                     bucket_pointer,
                     weighted_pointer,
@@ -802,7 +875,8 @@ void launch_ple_backward(
                     d_embedding,
                     n_batch_tiles,
                     n_d_tiles,
-                    total_tiles,
+                    n_partitions,
+                    total_persistent_tiles,
                     compute_grad_x,
                     compute_grad_weight
                 );
@@ -829,7 +903,10 @@ void launch_ple_backward(
                 )
             );
 
-            ple_backward_generic_kernel<grad_t><<<
+            ple_backward_generic_kernel<
+                grad_t,
+                bin_index_t
+            ><<<
                 generic_blocks,
                 kBlockThreads,
                 0,
@@ -838,8 +915,10 @@ void launch_ple_backward(
                 grad_output.data_ptr<grad_t>(),
                 x.data_ptr<float>(),
                 bin_edges.data_ptr<float>(),
+                inv_bin_widths.data_ptr<float>(),
                 n_bins.data_ptr<int32_t>(),
                 weight.data_ptr<float>(),
+                bin_indices.data_ptr<bin_index_t>(),
                 grad_x_pointer,
                 bucket_pointer,
                 weighted_pointer,
@@ -899,6 +978,66 @@ void launch_ple_backward(
     }
 }
 
+
+template <typename grad_t>
+void dispatch_bin_index_type_backward(
+    const at::Tensor& grad_output,
+    const at::Tensor& x,
+    const at::Tensor& bin_edges,
+    const at::Tensor& inv_bin_widths,
+    const at::Tensor& n_bins,
+    const at::Tensor& weight,
+    const at::Tensor& bin_indices,
+    at::Tensor& grad_x,
+    at::Tensor& grad_weight,
+    bool compute_grad_x,
+    bool compute_grad_weight
+) {
+    if (bin_indices.scalar_type() == at::kByte) {
+        launch_ple_backward<grad_t, uint8_t>(
+            grad_output,
+            x,
+            bin_edges,
+            inv_bin_widths,
+            n_bins,
+            weight,
+            bin_indices,
+            grad_x,
+            grad_weight,
+            compute_grad_x,
+            compute_grad_weight
+        );
+    } else if (bin_indices.scalar_type() == at::kShort) {
+        launch_ple_backward<grad_t, int16_t>(
+            grad_output,
+            x,
+            bin_edges,
+            inv_bin_widths,
+            n_bins,
+            weight,
+            bin_indices,
+            grad_x,
+            grad_weight,
+            compute_grad_x,
+            compute_grad_weight
+        );
+    } else {
+        launch_ple_backward<grad_t, int32_t>(
+            grad_output,
+            x,
+            bin_edges,
+            inv_bin_widths,
+            n_bins,
+            weight,
+            bin_indices,
+            grad_x,
+            grad_weight,
+            compute_grad_x,
+            compute_grad_weight
+        );
+    }
+}
+
 }  // namespace rtdl_num_embeddings_cuda
 
 
@@ -906,21 +1045,30 @@ std::tuple<at::Tensor, at::Tensor> ple_backward_cuda(
     const at::Tensor& grad_output,
     const at::Tensor& x,
     const at::Tensor& bin_edges,
+    const at::Tensor& inv_bin_widths,
     const at::Tensor& n_bins,
     const at::Tensor& weight,
+    const at::Tensor& bin_indices,
     bool compute_grad_x,
     bool compute_grad_weight
 ) {
     TORCH_CHECK(grad_output.is_cuda(), "grad_output must be CUDA");
     TORCH_CHECK(x.is_cuda(), "x must be CUDA");
     TORCH_CHECK(bin_edges.is_cuda(), "bin_edges must be CUDA");
+    TORCH_CHECK(
+        inv_bin_widths.is_cuda(),
+        "inv_bin_widths must be CUDA"
+    );
     TORCH_CHECK(n_bins.is_cuda(), "n_bins must be CUDA");
     TORCH_CHECK(weight.is_cuda(), "weight must be CUDA");
+    TORCH_CHECK(bin_indices.is_cuda(), "bin_indices must be CUDA");
     TORCH_CHECK(
         grad_output.device() == x.device()
         && x.device() == bin_edges.device()
+        && x.device() == inv_bin_widths.device()
         && x.device() == n_bins.device()
-        && x.device() == weight.device(),
+        && x.device() == weight.device()
+        && x.device() == bin_indices.device(),
         "All backward tensors must be on the same CUDA device"
     );
 
@@ -930,20 +1078,46 @@ std::tuple<at::Tensor, at::Tensor> ple_backward_cuda(
     );
     TORCH_CHECK(x.is_contiguous(), "x must be contiguous");
     TORCH_CHECK(bin_edges.is_contiguous(), "bin_edges must be contiguous");
+    TORCH_CHECK(
+        inv_bin_widths.is_contiguous(),
+        "inv_bin_widths must be contiguous"
+    );
     TORCH_CHECK(n_bins.is_contiguous(), "n_bins must be contiguous");
     TORCH_CHECK(weight.is_contiguous(), "weight must be contiguous");
+    TORCH_CHECK(
+        bin_indices.is_contiguous(),
+        "bin_indices must be contiguous"
+    );
 
     TORCH_CHECK(x.dim() == 2, "x must have shape [N, F]");
     TORCH_CHECK(
         grad_output.dim() == 3,
         "grad_output must have shape [N, F, D]"
     );
-    TORCH_CHECK(bin_edges.dim() == 2, "bin_edges must have shape [F, B+1]");
+    TORCH_CHECK(
+        bin_edges.dim() == 2,
+        "bin_edges must have shape [F, B+1]"
+    );
+    TORCH_CHECK(
+        inv_bin_widths.dim() == 2,
+        "inv_bin_widths must have shape [F, B]"
+    );
     TORCH_CHECK(n_bins.dim() == 1, "n_bins must have shape [F]");
     TORCH_CHECK(weight.dim() == 3, "weight must have shape [F, B, D]");
+    TORCH_CHECK(
+        bin_indices.dim() == 2,
+        "bin_indices must have shape [N, F]"
+    );
 
     TORCH_CHECK(x.scalar_type() == at::kFloat, "x must be float32");
-    TORCH_CHECK(bin_edges.scalar_type() == at::kFloat, "bin_edges must be float32");
+    TORCH_CHECK(
+        bin_edges.scalar_type() == at::kFloat,
+        "bin_edges must be float32"
+    );
+    TORCH_CHECK(
+        inv_bin_widths.scalar_type() == at::kFloat,
+        "inv_bin_widths must be float32"
+    );
     TORCH_CHECK(n_bins.scalar_type() == at::kInt, "n_bins must be int32");
     TORCH_CHECK(weight.scalar_type() == at::kFloat, "weight must be float32");
     TORCH_CHECK(
@@ -957,16 +1131,45 @@ std::tuple<at::Tensor, at::Tensor> ple_backward_cuda(
     const int64_t n_features = x.size(1);
     const int64_t max_n_bins = weight.size(1);
     const int64_t d_embedding = weight.size(2);
+    const at::ScalarType expected_bin_index_dtype = (
+        max_n_bins <= 256
+            ? at::kByte
+            : (
+                max_n_bins <= 32768
+                    ? at::kShort
+                    : at::kInt
+            )
+    );
 
+    TORCH_CHECK(
+        bin_indices.scalar_type() == expected_bin_index_dtype,
+        "bin_indices has an invalid dtype"
+    );
     TORCH_CHECK(
         grad_output.size(0) == batch_size
         && grad_output.size(1) == n_features
         && grad_output.size(2) == d_embedding,
         "grad_output shape must be [N, F, D]"
     );
+    TORCH_CHECK(
+        bin_indices.size(0) == batch_size
+        && bin_indices.size(1) == n_features,
+        "bin_indices shape must be [N, F]"
+    );
     TORCH_CHECK(weight.size(0) == n_features, "weight F mismatch");
     TORCH_CHECK(bin_edges.size(0) == n_features, "bin_edges F mismatch");
-    TORCH_CHECK(bin_edges.size(1) == max_n_bins + 1, "bin_edges B mismatch");
+    TORCH_CHECK(
+        bin_edges.size(1) == max_n_bins + 1,
+        "bin_edges B mismatch"
+    );
+    TORCH_CHECK(
+        inv_bin_widths.size(0) == n_features,
+        "inv_bin_widths F mismatch"
+    );
+    TORCH_CHECK(
+        inv_bin_widths.size(1) == max_n_bins,
+        "inv_bin_widths B mismatch"
+    );
     TORCH_CHECK(n_bins.size(0) == n_features, "n_bins F mismatch");
 
     c10::cuda::CUDAGuard device_guard(x.device());
@@ -987,36 +1190,46 @@ std::tuple<at::Tensor, at::Tensor> ple_backward_cuda(
     }
 
     if (grad_output.scalar_type() == at::kFloat) {
-        rtdl_num_embeddings_cuda::launch_ple_backward<float>(
+        rtdl_num_embeddings_cuda::dispatch_bin_index_type_backward<float>(
             grad_output,
             x,
             bin_edges,
+            inv_bin_widths,
             n_bins,
             weight,
+            bin_indices,
             grad_x,
             grad_weight,
             compute_grad_x,
             compute_grad_weight
         );
     } else if (grad_output.scalar_type() == at::kHalf) {
-        rtdl_num_embeddings_cuda::launch_ple_backward<c10::Half>(
+        rtdl_num_embeddings_cuda::dispatch_bin_index_type_backward<
+            c10::Half
+        >(
             grad_output,
             x,
             bin_edges,
+            inv_bin_widths,
             n_bins,
             weight,
+            bin_indices,
             grad_x,
             grad_weight,
             compute_grad_x,
             compute_grad_weight
         );
     } else {
-        rtdl_num_embeddings_cuda::launch_ple_backward<c10::BFloat16>(
+        rtdl_num_embeddings_cuda::dispatch_bin_index_type_backward<
+            c10::BFloat16
+        >(
             grad_output,
             x,
             bin_edges,
+            inv_bin_widths,
             n_bins,
             weight,
+            bin_indices,
             grad_x,
             grad_weight,
             compute_grad_x,
